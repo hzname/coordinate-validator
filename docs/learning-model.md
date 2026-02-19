@@ -1,100 +1,95 @@
-# Coordinate Validator - Модель данных
+# Coordinate Validator - Learning Model
 
-## Два потока данных
+## Two Data Streams
 
-### 1. Уточнение (Refinement)
-- Входящие данные для **валидации**
-- Используются ТОЛЬКО для проверки координат
-- **НЕ участвуют в обучении**
+### 1. Refinement (Validation)
+- Incoming data for **validation**
+- Used ONLY for checking coordinates
+- Does NOT participate in learning
 
-### 2. Обучение (Learning)
-- Отдельный поток данных
-- Только "сопровождающие" источники
-- Обновляет CALCULATED координаты
-
----
-
-## Фильтр: определение "сопровождающих"
-
-### Проблема
-WiFi/BLE источники могут быть:
-- **Сопровождающие** — постоянно рядом с объектом
-- **Проходящие мимо** — появились 1 раз
-
-### Решение: Анализ co-occurrence
-
-```
-Источник X сопровождает объект Y если:
-- Появляется вместе > N раз
-- Паттерн появления стабилен
-```
-
-### Параметры
-
-| Параметр | Значение | Описание |
-|-----------|----------|----------|
-| MIN_CO_OCCURRENCES | 3 | Мин. совместных появлений |
-| CO_OCCURRENCE_WINDOW | 1 час | Окно анализа |
-| STABILITY_THRESHOLD | 0.7 | Стабильность паттерна |
+### 2. Learning
+- Separate data stream
+- Only "stationary" sources
+- Updates CALCULATED coordinates
 
 ---
 
-## Архитектура потоков
+## Filter: Stationary Detection
+
+### Problem
+WiFi/BLE sources can be:
+- **Stationary** - permanently at fixed location (home WiFi, office AP)
+- **Random** - appearing only once or rarely (passing by)
+
+### Solution: Stationarity Check
+
+```
+Source is STATIONARY if:
+- Appears at least MIN times
+- Location is consistent (low variance)
+```
+
+### Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| MIN_OBSERVATIONS | 3 | Min appearances for stationary |
+| VARIANCE_THRESHOLD | 0.0001 | Max lat/lon variance (roughly 10m) |
+| TIME_WINDOW | 24 hours | Analysis window |
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Input["Входные данные"]
-        Refine[Поток УТОЧНЕНИЕ<br/>Validate API]
-        Learn[Поток ОБУЧЕНИЕ<br/>Learn API]
+    subgraph Input
+        Refine[Refinement<br/>Validate API]
+        Learn[Learning<br/>Learn API]
     end
     
-    subgraph Process["Обработка"]
-        Refine --> Validate[Валидация]
-        Learn --> Filter[Фильтр: сопровождение?]
-        Filter --> Update[Обучение]
+    subgraph Process
+        Refine --> Validate
+        Learn --> StationaryCheck
+        StationaryCheck --> Update
     end
     
-    subgraph Output["Выход"]
+    subgraph Output
         Validate --> Result[VALID/INVALID/UNCERTAIN]
         Update --> DB[CALCULATED coordinates]
     end
     
-    Refine -.->|"Не участвует"| Update
+    Refine -.-> NotLearn
 ```
 
 ---
 
 ## API
 
-### Уточнение (Refinement)
+### Refinement (NO learning)
 
 ```protobuf
 service CoordinateValidator {
-    // Только валидация, НЕ обучение
     rpc Validate(CoordinateRequest) returns (CoordinateResponse);
     rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
 }
 ```
 
-### Обучение (Learning)
+### Learning (separate stream)
 
 ```protobuf
 service LearningService {
-    // Обучение - отдельный поток
     rpc LearnFromCoordinates(LearnRequest) returns (LearnResponse);
-    
-    // Получить список сопровождающих источников
-    rpc GetCompanionSources(GetCompanionsRequest) returns (GetCompanionsResponse);
+    rpc GetStationarySources(GetStationaryRequest) returns (GetStationaryResponse);
 }
 
 message LearnRequest {
-    string object_id = 1;       // ID объекта
+    string object_id = 1;
     double latitude = 2;
     double longitude = 3;
     float accuracy = 4;
     int64 timestamp = 5;
     
-    // Источники для анализа
     repeated WifiAccessPoint wifi = 6;
     repeated BluetoothDevice bluetooth = 7;
     repeated CellTower cell_towers = 8;
@@ -102,95 +97,98 @@ message LearnRequest {
 
 message LearnResponse {
     LearningResult result = 1;
-    repeated string included_sources = 2;   // Сопровождающие - в обучение
-    repeated string excluded_sources = 3;  // Проходящие - исключены
+    repeated string stationary_sources = 2;  // Added to learning
+    repeated string random_sources = 3;       // Excluded - too few observations
 }
 
-message GetCompanionsRequest {
+enum LearningResult {
+    LEARNED = 0;
+    NEED_MORE_DATA = 1;
+    STATIONARY_DETECTED = 2;
+    RANDOM_EXCLUDED = 3;
+}
+
+message GetStationaryRequest {
     string object_id = 1;
     PointType point_type = 2;
 }
 
-message GetCompanionsResponse {
-    repeated CompanionSource companions = 1;
+message GetStationaryResponse {
+    repeated StationarySource sources = 1;
 }
 
-message CompanionSource {
+message StationarySource {
     string point_id = 1;
     PointType point_type = 2;
-    int32 co_occurrences = 3;
-    float stability = 4;
-    int64 first_seen = 5;
-    int64 last_seen = 6;
+    int32 observations = 3;
+    float variance = 4;
+    bool is_stationary = 5;
+    int64 first_seen = 6;
+    int64 last_seen = 7;
 }
 ```
 
 ---
 
-## Алгоритм: Определение сопровождения
+## Algorithm: Stationary Detection
 
 ```mermaid
 flowchart TD
-    subgraph Input["Новые источники<br/>от объекта"]
-        Obj[Объект ID]
-        Sources[WiFi/BLE Cell]
-    end
-
-    subgraph CoOccurrence["Co-Occurrence анализ"]
-        Check{Первый<br/>раз?}
-    end
-
-    Check -->|Да| Record[Записать<br/>co_occurrence]
-    Check -->|Нет| GetHistory[Получить<br/>историю]
-
-    Record --> Result1[СТАТУС: NEW]
-
-    GetHistory --> Analyze[Анализ:<br/>частота + стабильность]
-
-    Analyze --> Frequency{Частота<br/>> MIN?}
-    Frequency -->|Нет| NotCompanion[НЕ<br/>сопровождающий]
-    Frequency -->|Да| Stability{Паттерн<br/>> STABILITY?}
-
-    Stability -->|Нет| Unstable[Нестабильный]
-    Stability -->|Да| IsCompanion[СОПРОВОЖДАЮЩИЙ]
-
-    NotCompanion --> Result2[СТАТУС: EXCLUDED]
-    Unstable --> Result2
-    IsCompanion --> Result3[СТАТУС: INCLUDED]
+    Input[New source<br/>from object] --> GetHistory[Get observation<br/>history]
+    
+    GetHistory --> Count{observations<br/>>= MIN?}
+    
+    Count -->|No| Random[Too few<br/>observations]
+    Random --> Exclude[RANDOM<br/>Not used in learning]
+    
+    Count -->|Yes| CalcVariance[Calculate<br/>lat/lon variance]
+    
+    CalcVariance --> VarianceOK{variance<br/>< THRESHOLD?}
+    
+    VarianceOK -->|Yes| Stationary[Variance low<br/>Location consistent]
+    VarianceOK -->|No| Unstable[Variance high<br/>Location unstable]
+    
+    Stationary --> Include[STATIONARY<br/>Use in learning]
+    Unstable --> Exclude2[Exclude<br/>Not stationary]
 ```
 
-### Критерии статуса
+### Status Values
 
-| Статус | Условие | Действие |
-|--------|---------|----------|
-| **NEW** | Первый раз | Пропустить, ждать след. появлений |
-| **INCLUDED** | Частота > MIN, Стабильность > 0.7 | Добавить в CALCULATED |
-| **EXCLUDED** | Частота < MIN или Стабильность < 0.7 | Исключить |
+| Status | Condition | Learning |
+|--------|-----------|----------|
+| **NEW** | First appearance | ❌ No |
+| **STATIONARY** | Observations >= MIN AND variance < threshold | ✅ Yes |
+| **RANDOM** | Observations < MIN OR variance > threshold | ❌ No |
 
 ---
 
-## Redis структура
+## Redis Structure
 
 ```
-# Co-occurrence записи
-co_occurrence:{object_id}:{source_type}:{source_id} → {
+# Source observations (for stationary detection)
+observation:{object_id}:{source_type}:{source_id} → {
     object_id,
     source_type,    // wifi, ble, cell
     source_id,      // BSSID, MAC, CellID
-    co_occurrences, // сколько раз вместе
-    observations,   // сколько раз видели источник
-    stability,     // co_occurrences / observations
+    observations: [
+        {lat, lon, timestamp},
+        {lat, lon, timestamp},
+        ...
+    ],
+    observations_count,
+    variance_lat,
+    variance_lon,
+    status: NEW | STATIONARY | RANDOM,
     first_seen,
-    last_seen,
-    status: NEW | INCLUDED | EXCLUDED
+    last_seen
 }
 
-# CALCULATED координаты
+# CALCULATED coordinates
 calculated:{type}:{id} → {
     lat, lon, confidence, observations
 }
 
-# ABSOLUTE координаты
+# ABSOLUTE coordinates
 absolute:{type}:{id} → {
     lat, lon, accuracy, source, expires_at
 }
@@ -198,93 +196,120 @@ absolute:{type}:{id} → {
 
 ---
 
-## Примеры
+## Examples
 
-### Пример 1: Новый источник
+### Example 1: New source
 
 ```
-Запрос LearnFromCoordinates:
+Request LearnFromCoordinates:
   object_id: "vehicle_123"
   WiFi: ["AA:BB:CC:DD:EE:FF"]
-  Cell: [12345]
 
 Redis:
-  co_occurrence:vehicle_123:wifi:AA:BB:CC:DD:EE:FF
-    co_occurrences: 1
-    observations: 1
-    stability: 1.0
+  observation:vehicle_123:wifi:AA:BB:CC:DD:EE:FF
+    observations: [{lat: 55.75, lon: 37.61, ts: ...}]
+    observations_count: 1
     status: NEW
 
-Ответ:
-  included_sources: []
-  excluded_sources: []
+Response:
   result: NEED_MORE_DATA
+  stationary_sources: []
+  random_sources: []
 ```
 
-### Пример 2: Источник исключён
+### Example 2: Random (too few observations)
 
 ```
-После 5 появлений объекта:
-  co_occurrences: 2     # только 2 раза вместе
-  observations: 5        # видели 5 раз
-  stability: 0.4        # 40% - низкая
+After 2 observations:
+  observations_count: 2
+  MIN_OBSERVATIONS: 3
+  status: RANDOM (not enough data)
 
-Статус: EXCLUDED
-
-Ответ:
-  excluded_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
-  result: EXCLUDED
+Response:
+  result: RANDOM_EXCLUDED
+  random_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
 ```
 
-### Пример 3: Сопровождающий источник
+### Example 3: Stationary detected
 
 ```
-После 10 появлений:
-  co_occurrences: 9     # 9 раз вместе
-  observations: 10      # видели 10 раз
-  stability: 0.9        # 90% - высокая
+After 5 observations:
+  observations: [
+    {lat: 55.7558, lon: 37.6173},
+    {lat: 55.7559, lon: 37.6174},
+    {lat: 55.7557, lon: 37.6172},
+    {lat: 55.7558, lon: 37.6173},
+    {lat: 55.7559, lon: 37.6174}
+  ]
+  observations_count: 5
+  variance_lat: 0.00001
+  variance_lon: 0.00001
+  VARIANCE_THRESHOLD: 0.0001
+  status: STATIONARY
 
-Статус: INCLUDED
+Response:
+  result: STATIONARY_DETECTED
+  stationary_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
 
-CALCULATED обновлён
+CALCULATED updated
+```
+
+### Example 4: Random (high variance)
+
+```
+After 5 observations:
+  observations: [
+    {lat: 55.75, lon: 37.61},
+    {lat: 55.80, lon: 37.70},
+    {lat: 55.60, lon: 37.50},
+    {lat: 55.90, lon: 37.80},
+    {lat: 55.70, lon: 37.55}
+  ]
+  observations_count: 5
+  variance_lat: 0.015
+  variance_lon: 0.020
+  VARIANCE_THRESHOLD: 0.0001
+  status: RANDOM (high variance)
+
+Response:
+  result: RANDOM_EXCLUDED
+  random_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
 ```
 
 ---
 
-## Модель координат
+## Three Coordinate Types
 
-### Три типа координат
+| Type | Purpose | Source |
+|------|---------|--------|
+| **ABSOLUTE** | Reference | Reliable API |
+| **CALCULATED** | Computed | Learning |
+| **DEVIATION** | Deviations | Current measurements |
 
-| Тип | Назначение | Источник |
-|-----|-----------|----------|
-| **ABSOLUTE** | Эталонные | Надёжный API |
-| **CALCULATED** | Вычисленные | Обучение |
-| **DEVIATION** | Отклонения | Текущие измерения |
+### Rules
 
-### Правила
-
-1. **Уточнение (Validate)** — использует ABSOLUTE/CALCULATED, НЕ обучает
-2. **Обучение (Learn)** — только INCLUDED источники обновляют CALCULATED
-3. **ABSOLUTE** — не обучается, только справочные данные
+1. **Refinement (Validate)** - uses ABSOLUTE/CALCULATED, does NOT learn
+2. **Learning (Learn)** - only STATIONARY sources update CALCULATED
+3. **ABSOLUTE** - reference only, not learned
 
 ---
 
-## Триангуляция
+## Triangulation
 
-### Радиусы неопределённости
+### Uncertainty Radii
 
-| Источник | Радиус |
-|----------|--------|
-| WiFi | 50м |
-| BLE | 15м |
-| Cell (LAC) | 3000м |
-| Cell (ATC) | 300м |
+| Source | Radius |
+|--------|--------|
+| WiFi | 50m |
+| BLE | 15m |
+| Cell (LAC) | 3000m |
+| Cell (ATC) | 300m |
 
-### Пересечение областей
+### Intersection
 
 ```
 WiFi (BSSID) ──┐
-                 │  → Центр пересечения → Позиция
+                 │  → Intersection center → Position
 Cell Tower ─────┤
                  │
 BLE Device ─────┘
@@ -292,42 +317,43 @@ BLE Device ─────┘
 
 ---
 
-## Конфигурация
+## Configuration
 
 ```yaml
 learning:
-  # Минимум совместных появлений
-  min_co_occurrences: 3
+  # Minimum observations for stationary status
+  min_observations: 3
   
-  # Окно анализа (часы)
-  co_occurrence_window_hours: 1
+  # Maximum variance for stationary (degrees^2)
+  # 0.0001 ≈ 10 meters
+  variance_threshold: 0.0001
   
-  # Порог стабильности (0-1)
-  stability_threshold: 0.7
+  # Analysis time window (hours)
+  time_window_hours: 24
 
 positioning:
   radius:
-    wifi: 50        # метров
-    ble: 15         # метров
-    cell_lac: 3000  # метров
-    cell_atc: 300   # метров
+    wifi: 50
+    ble: 15
+    cell_lac: 3000
+    cell_atc: 300
   
-  min_sources: 2    # минимум для пересечения
+  min_sources: 2
   
-  deviation_threshold: 50  # метров
+  deviation_threshold: 50
 ```
 
 ---
 
-## Резюме
+## Summary
 
-| Поток | Метод | Обучение |
-|-------|-------|----------|
-| Уточнение | Validate() | ❌ НЕТ |
-| Обучение | LearnFromCoordinates() | ✅ ДА |
+| Stream | Method | Learning |
+|--------|--------|----------|
+| Refinement | Validate() | ❌ NO |
+| Learning | LearnFromCoordinates() | ✅ YES |
 
-| Источник | Статус | Обучение |
-|----------|--------|----------|
-| NEW | Неизвестно | ❌ |
-| INCLUDED | Сопровождающий | ✅ |
-| EXCLUDED | Проходящий мимо | ❌ |
+| Source Status | Condition | Learning |
+|---------------|-----------|----------|
+| **NEW** | First appearance | ❌ No |
+| **STATIONARY** | >= MIN observations AND variance < threshold | ✅ Yes |
+| **RANDOM** | < MIN observations OR variance > threshold | ❌ No |
