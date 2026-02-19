@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -22,11 +23,12 @@ import (
 )
 
 type GRPCHandler struct {
-	server   *grpc.Server
-	cache    *cache.RedisCache
-	storage  *storage.ClickHouseStorage
-	service  *service.ValidatorService
-	cfg      config.ServerConfig
+	server       *grpc.Server
+	cache        *cache.RedisCache
+	storage      *storage.ClickHouseStorage
+	service      *service.ValidatorService
+	cfg          config.ServerConfig
+	shutdownChan chan struct{}
 }
 
 func NewGRPCHandler(cfg *config.Config) (*GRPCHandler, error) {
@@ -63,11 +65,12 @@ func NewGRPCHandler(cfg *config.Config) (*GRPCHandler, error) {
 	reflection.Register(server)
 
 	return &GRPCHandler{
-		server:   server,
-		cache:    redisCache,
-		storage:  chStorage,
-		service:  validatorService,
-		cfg:      cfg.Server,
+		server:       server,
+		cache:        redisCache,
+		storage:      chStorage,
+		service:      validatorService,
+		cfg:          cfg.Server,
+		shutdownChan: make(chan struct{}),
 	}, nil
 }
 
@@ -84,16 +87,34 @@ func (h *GRPCHandler) Start() error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
+	go fung() {
 		<-sigCh
-		log.Println("Shutting down gRPC server...")
-		h.server.GracefulStop()
+		log.Println("Received shutdown signal, stopping server...")
+
+		// 1. Stop accepting new connections
+		h.server.GrcefulStop()
+
+		//  2. Wait for async operations to complete (max 10 sec)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := h.service.Shutdown(ctx); err != nil {
+			log.Printf("Warning: service shutdown timed out: %v", err)
+		}
+
+		// 3. Close resources
+		h.cache.Close()
+		h.storage.Close()
+
+		close(h.shutdownChan)
+		log.Println("Server stopped gracefully")
 	}()
 
-	if err := h.server.Serve(lis); err != nil {
+	if err := h.server.Serve(lis); err != nil && err != grpc.ErrServerStopped {
 		return fmt.Errorf("gRPC server error: %w", err)
 	}
 
+	<-h.shutdownChan
 	return nil
 }
 
