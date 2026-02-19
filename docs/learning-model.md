@@ -14,28 +14,169 @@
 
 ---
 
-## Filter: Stationary Detection
+## Configuration Parameters
 
-### Problem
-WiFi/BLE sources can be:
-- **Stationary** - permanently at fixed location (home WiFi, office AP)
-- **Random** - appearing only once or rarely (passing by)
+All thresholds are configurable via Admin API or configuration file.
 
-### Solution: Stationarity Check
+### Validation Parameters
 
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `validation.max_speed_kmh` | 150 | 50-500 | Max allowed speed (km/h) |
+| `validation.max_time_diff_hours` | 12 | 1-72 | Max timestamp deviation (hours) |
+| `validation.min_accuracy_meters` | 100 | 10-500 | Min GPS accuracy to accept |
+
+### Stationary Detection Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `learning.min_observations` | 3 | 1-10 | Min appearances for stationary |
+| `learning.variance_threshold` | 0.0001 | 0.00001-0.001 | Max lat/lon variance (degrees² ≈ meters) |
+| `learning.time_window_hours` | 24 | 1-168 | Analysis time window |
+
+### Positioning Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `positioning.radius_wifi_meters` | 50 | 10-100 | WiFi uncertainty radius |
+| `positioning.radius_ble_meters` | 5 | 1-30 | BLE uncertainty radius |
+| `positioning.radius_cell_lac_meters` | 3000 | 500-10000 | Cell LAC uncertainty radius |
+| `positioning.radius_cell_atc_meters` | 300 | 50-1000 | Cell ATC uncertainty radius |
+| `positioning.min_sources` | 2 | 1-5 | Min sources for triangulation |
+| `positioning.deviation_threshold_meters` | 50 | 10-200 | Max deviation for validation |
+
+### Adaptive Thresholds
+
+Thresholds scale based on number of sources:
+
+```yaml
+# Formula: BASE + (sources - 1) * STEP
+adaptive:
+  absolute_threshold_base: 50      # meters
+  absolute_threshold_step: 10      # per source
+  deviation_threshold_base: 100    # meters
+  deviation_threshold_step: 20     # per source
 ```
-Source is STATIONARY if:
-- Appears at least MIN times
-- Location is consistent (low variance)
+
+### Mobile Filter Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `filter.rssi_change_threshold` | 10 | Max RSSI change (dBm) per window |
+| `filter.rssi_change_window_seconds` | 60 | RSSI analysis window |
+
+---
+
+## Admin API
+
+All parameters can be managed via Admin API:
+
+```protobuf
+service AdminService {
+    // Get all parameters
+    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+    
+    // Update parameter
+    rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+    
+    // Reset to defaults
+    rpc ResetConfig(ResetConfigRequest) returns (ResetConfigResponse);
+    
+    // Get config history
+    rpc GetConfigHistory(HistoryRequest) returns (HistoryResponse);
+}
+
+message GetConfigRequest {
+    string category = 1;  // "validation", "learning", "positioning", "filter"
+}
+
+message UpdateConfigRequest {
+    string key = 1;
+    string value = 2;
+    string reason = 3;  // Reason for change
+}
+
+message UpdateConfigResponse {
+    bool success = 1;
+    string old_value = 2;
+    string new_value = 3;
+    int64 changed_at = 4;
+}
 ```
 
-### Parameters
+### Example: Update threshold
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| MIN_OBSERVATIONS | 3 | Min appearances for stationary |
-| VARIANCE_THRESHOLD | 0.0001 | Max lat/lon variance (roughly 10m) |
-| TIME_WINDOW | 24 hours | Analysis window |
+```bash
+# Update max speed
+grpcurl -plaintext -d '{
+  "key": "validation.max_speed_kmh",
+  "value": "200",
+  "reason": "High-speed vehicle tracking"
+}' localhost:50051 coordinate.Admin/UpdateConfig
+
+# Get all learning params
+grpcurl -plaintext -d '{
+  "category": "learning"
+}' localhost:50051 coordinate.Admin/GetConfig
+```
+
+---
+
+## Configuration File
+
+```yaml
+validation:
+  max_speed_kmh: 150
+  max_time_diff_hours: 12
+  min_accuracy_meters: 100
+
+learning:
+  min_observations: 3
+  variance_threshold: 0.0001
+  time_window_hours: 24
+
+positioning:
+  radius_wifi_meters: 50
+  radius_ble_meters: 15
+  radius_cell_lac_meters: 3000
+  radius_cell_atc_meters: 300
+  min_sources: 2
+  deviation_threshold_meters: 50
+
+adaptive:
+  absolute_threshold_base: 50
+  absolute_threshold_step: 10
+  deviation_threshold_base: 100
+  deviation_threshold_step: 20
+
+filter:
+  rssi_change_threshold: 10
+  rssi_change_window_seconds: 60
+```
+
+---
+
+## Configuration Flow
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        AdminUI[Admin UI]
+        ConfigFile[config.yaml]
+        EnvVars[Environment Variables]
+    end
+    
+    subgraph Validation
+        Check{Validate<br/>parameter}
+    end
+    
+    AdminUI --> Check
+    ConfigFile --> Check
+    EnvVars --> Check
+    
+    Check --> Apply[Apply to<br/>system]
+    Apply --> Log[Log change<br/>history]
+```
 
 ---
 
@@ -64,296 +205,68 @@ flowchart LR
 
 ---
 
-## API
-
-### Refinement (NO learning)
-
-```protobuf
-service CoordinateValidator {
-    rpc Validate(CoordinateRequest) returns (CoordinateResponse);
-    rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
-}
-```
-
-### Learning (separate stream)
-
-```protobuf
-service LearningService {
-    rpc LearnFromCoordinates(LearnRequest) returns (LearnResponse);
-    rpc GetStationarySources(GetStationaryRequest) returns (GetStationaryResponse);
-}
-
-message LearnRequest {
-    string object_id = 1;
-    double latitude = 2;
-    double longitude = 3;
-    float accuracy = 4;
-    int64 timestamp = 5;
-    
-    repeated WifiAccessPoint wifi = 6;
-    repeated BluetoothDevice bluetooth = 7;
-    repeated CellTower cell_towers = 8;
-}
-
-message LearnResponse {
-    LearningResult result = 1;
-    repeated string stationary_sources = 2;  // Added to learning
-    repeated string random_sources = 3;       // Excluded - too few observations
-}
-
-enum LearningResult {
-    LEARNED = 0;
-    NEED_MORE_DATA = 1;
-    STATIONARY_DETECTED = 2;
-    RANDOM_EXCLUDED = 3;
-}
-
-message GetStationaryRequest {
-    string object_id = 1;
-    PointType point_type = 2;
-}
-
-message GetStationaryResponse {
-    repeated StationarySource sources = 1;
-}
-
-message StationarySource {
-    string point_id = 1;
-    PointType point_type = 2;
-    int32 observations = 3;
-    float variance = 4;
-    bool is_stationary = 5;
-    int64 first_seen = 6;
-    int64 last_seen = 7;
-}
-```
-
----
-
 ## Algorithm: Stationary Detection
 
 ```mermaid
 flowchart TD
-    Input[New source<br/>from object] --> GetHistory[Get observation<br/>history]
+    Input --> GetHistory
     
-    GetHistory --> Count{observations<br/>>= MIN?}
+    GetHistory --> Count
     
-    Count -->|No| Random[Too few<br/>observations]
-    Random --> Exclude[RANDOM<br/>Not used in learning]
+    Count -->|No| Random
+    Random --> Exclude
     
-    Count -->|Yes| CalcVariance[Calculate<br/>lat/lon variance]
+    Count -->|Yes| CalcVariance
     
-    CalcVariance --> VarianceOK{variance<br/>< THRESHOLD?}
+    CalcVariance --> VarianceOK
     
-    VarianceOK -->|Yes| Stationary[Variance low<br/>Location consistent]
-    VarianceOK -->|No| Unstable[Variance high<br/>Location unstable]
+    VarianceOK -->|Yes| Stationary
+    VarianceOK -->|No| Unstable
     
-    Stationary --> Include[STATIONARY<br/>Use in learning]
-    Unstable --> Exclude2[Exclude<br/>Not stationary]
+    Stationary --> Include
+    Unstable --> Exclude2
 ```
-
-### Status Values
-
-| Status | Condition | Learning |
-|--------|-----------|----------|
-| **NEW** | First appearance | ❌ No |
-| **STATIONARY** | Observations >= MIN AND variance < threshold | ✅ Yes |
-| **RANDOM** | Observations < MIN OR variance > threshold | ❌ No |
 
 ---
 
 ## Redis Structure
 
 ```
-# Source observations (for stationary detection)
+# Configuration (cached)
+config:{category}:{key} → value
+
+# Configuration history
+config_history:{key} → [
+    {value, changed_at, changed_by, reason},
+    ...
+]
+
+# Source observations
 observation:{object_id}:{source_type}:{source_id} → {
-    object_id,
-    source_type,    // wifi, ble, cell
-    source_id,      // BSSID, MAC, CellID
-    observations: [
-        {lat, lon, timestamp},
-        {lat, lon, timestamp},
-        ...
-    ],
+    observations: [{lat, lon, timestamp}],
     observations_count,
-    variance_lat,
-    variance_lon,
+    variance_lat, variance_lon,
     status: NEW | STATIONARY | RANDOM,
-    first_seen,
-    last_seen
+    first_seen, last_seen
 }
 
 # CALCULATED coordinates
-calculated:{type}:{id} → {
-    lat, lon, confidence, observations
-}
+calculated:{type}:{id} → {lat, lon, confidence, observations}
 
 # ABSOLUTE coordinates
-absolute:{type}:{id} → {
-    lat, lon, accuracy, source, expires_at
-}
-```
-
----
-
-## Examples
-
-### Example 1: New source
-
-```
-Request LearnFromCoordinates:
-  object_id: "vehicle_123"
-  WiFi: ["AA:BB:CC:DD:EE:FF"]
-
-Redis:
-  observation:vehicle_123:wifi:AA:BB:CC:DD:EE:FF
-    observations: [{lat: 55.75, lon: 37.61, ts: ...}]
-    observations_count: 1
-    status: NEW
-
-Response:
-  result: NEED_MORE_DATA
-  stationary_sources: []
-  random_sources: []
-```
-
-### Example 2: Random (too few observations)
-
-```
-After 2 observations:
-  observations_count: 2
-  MIN_OBSERVATIONS: 3
-  status: RANDOM (not enough data)
-
-Response:
-  result: RANDOM_EXCLUDED
-  random_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
-```
-
-### Example 3: Stationary detected
-
-```
-After 5 observations:
-  observations: [
-    {lat: 55.7558, lon: 37.6173},
-    {lat: 55.7559, lon: 37.6174},
-    {lat: 55.7557, lon: 37.6172},
-    {lat: 55.7558, lon: 37.6173},
-    {lat: 55.7559, lon: 37.6174}
-  ]
-  observations_count: 5
-  variance_lat: 0.00001
-  variance_lon: 0.00001
-  VARIANCE_THRESHOLD: 0.0001
-  status: STATIONARY
-
-Response:
-  result: STATIONARY_DETECTED
-  stationary_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
-
-CALCULATED updated
-```
-
-### Example 4: Random (high variance)
-
-```
-After 5 observations:
-  observations: [
-    {lat: 55.75, lon: 37.61},
-    {lat: 55.80, lon: 37.70},
-    {lat: 55.60, lon: 37.50},
-    {lat: 55.90, lon: 37.80},
-    {lat: 55.70, lon: 37.55}
-  ]
-  observations_count: 5
-  variance_lat: 0.015
-  variance_lon: 0.020
-  VARIANCE_THRESHOLD: 0.0001
-  status: RANDOM (high variance)
-
-Response:
-  result: RANDOM_EXCLUDED
-  random_sources: ["wifi:AA:BB:CC:DD:EE:FF"]
-```
-
----
-
-## Three Coordinate Types
-
-| Type | Purpose | Source |
-|------|---------|--------|
-| **ABSOLUTE** | Reference | Reliable API |
-| **CALCULATED** | Computed | Learning |
-| **DEVIATION** | Deviations | Current measurements |
-
-### Rules
-
-1. **Refinement (Validate)** - uses ABSOLUTE/CALCULATED, does NOT learn
-2. **Learning (Learn)** - only STATIONARY sources update CALCULATED
-3. **ABSOLUTE** - reference only, not learned
-
----
-
-## Triangulation
-
-### Uncertainty Radii
-
-| Source | Radius |
-|--------|--------|
-| WiFi | 50m |
-| BLE | 15m |
-| Cell (LAC) | 3000m |
-| Cell (ATC) | 300m |
-
-### Intersection
-
-```
-WiFi (BSSID) ──┐
-                 │  → Intersection center → Position
-Cell Tower ─────┤
-                 │
-BLE Device ─────┘
-```
-
----
-
-## Configuration
-
-```yaml
-learning:
-  # Minimum observations for stationary status
-  min_observations: 3
-  
-  # Maximum variance for stationary (degrees^2)
-  # 0.0001 ≈ 10 meters
-  variance_threshold: 0.0001
-  
-  # Analysis time window (hours)
-  time_window_hours: 24
-
-positioning:
-  radius:
-    wifi: 50
-    ble: 15
-    cell_lac: 3000
-    cell_atc: 300
-  
-  min_sources: 2
-  
-  deviation_threshold: 50
+absolute:{type}:{id} → {lat, lon, accuracy, source, expires_at}
 ```
 
 ---
 
 ## Summary
 
-| Stream | Method | Learning |
-|--------|--------|----------|
-| Refinement | Validate() | ❌ NO |
-| Learning | LearnFromCoordinates() | ✅ YES |
+| Category | Parameters | Admin API |
+|----------|------------|-----------|
+| Validation | max_speed, max_time, min_accuracy | ✅ |
+| Learning | min_observations, variance, time_window | ✅ |
+| Positioning | radii, min_sources, deviation | ✅ |
+| Adaptive | threshold_base, threshold_step | ✅ |
+| Filter | rssi_change_threshold | ✅ |
 
-| Source Status | Condition | Learning |
-|---------------|-----------|----------|
-| **NEW** | First appearance | ❌ No |
-| **STATIONARY** | >= MIN observations AND variance < threshold | ✅ Yes |
-| **RANDOM** | < MIN observations OR variance > threshold | ❌ No |
+All parameters are runtime-configurable with history tracking.
