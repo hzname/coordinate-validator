@@ -106,6 +106,10 @@ grpcurl -plaintext -d '{
   - Cell: 0.3
   - Bluetooth: 0.3
 
+## Документация
+
+- [Архитектура](docs/architecture.md) - Диаграммы архитектуры, flow валидации, структуры данных
+
 ## Разработка
 
 ```bash
