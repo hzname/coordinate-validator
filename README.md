@@ -1,59 +1,70 @@
 # Coordinate Validator
 
-Микросервис для валидации GPS координат с использованием gRPC, Go, Redis и ClickHouse.
+Microservice for GPS coordinate validation using gRPC, Go, Redis and ClickHouse.
 
-## Возможности
+## Features
 
-- Валидация координат по скорости перемещения (max 150 км/ч)
-- Проверка временной метки (max 12 часов)
-- Проверка по известным WiFi точкам
-- Проверка по известным вышкам сотовой связи
-- Проверка по известным Bluetooth устройствам
-- Самообучение (запись новых точек доступа)
-- Асинхронное сохранение в ClickHouse
-- Поддержка EGTS протокола (подписки 91, 92)
+- Coordinate validation by speed (max 150 km/h)
+- Timestamp validation (max 12 hours)
+- Triangulation using WiFi, Cell towers, Bluetooth
+- Self-learning with companion detection
+- Asynchronous storage in ClickHouse
+- EGTS protocol support (subrecords 91, 92)
+- Two-stream model: refinement vs learning
 
-## EGTS Протокол
+## Two Data Streams
 
-Система поддерживает данные из EGTS (ЕГТС) протокола:
+### 1. Refinement (Validation)
+- Incoming data for validation
+- Used ONLY for checking coordinates
+- Does NOT participate in learning
 
-### Подписка 91: EGTS_ENVELOPE_HIGHT
-Данные о видимых базовых станциях сотовой сети.
+### 2. Learning
+- Separate data stream
+- Only "companion" sources
+- Updates CALCULATED coordinates
 
-| Поле | Описание |
-|------|----------|
-| CID | ID базовой станции |
-| LAC | Код локальной зоны |
-| MCC | Код страны |
-| MNC | Код оператора |
-| RSSI | Уровень сигнала (+128 offset) |
-| EID | Инвертированный RSSI (*-1) |
+## EGTS Protocol
 
-### Подписка 92: EGTS_ENVELOPE_LOW
-Данные о видимых источниках WiFi / BLE.
+System supports EGTS (Egts Telematics) protocol data:
 
-| Поле | Описание |
-|------|----------|
-| ENVTYPE | Тип: 0 = WiFi, 1 = BLE |
-| CID | MAC-адрес источника |
-| EID | Инвертированный уровень сигнала |
+### Subrecord 91: EGTS_ENVELOPE_HIGHT
+Cell tower data.
 
-## Архитектура
+| Field | Description |
+|-------|-------------|
+| CID | Base station ID |
+| LAC | Local Area Code |
+| MCC | Mobile Country Code |
+| MNC | Mobile Network Code |
+| RSSI | Signal level (+128 offset) |
+| EID | Inverted RSSI (*-1) |
+
+### Subrecord 92: EGTS_ENVELOPE_LOW
+WiFi / BLE data.
+
+| Field | Description |
+|-------|-------------|
+| ENVTYPE | Type: 0 = WiFi, 1 = BLE |
+| CID | MAC address |
+| EID | Inverted signal level |
+
+## Architecture
 
 ```
-[EGTS Client] → [gRPC] → [Validator Service] → [Redis (cache)]
+[Client] → [gRPC] → [Validator Service] → [Redis (cache)]
                                               ↓
                                         [ClickHouse (storage)]
 ```
 
-## Быстрый старт
+## Quick Start
 
-### Требования
+### Requirements
 
 - Go 1.21+
 - Docker & Docker Compose
 
-### Запуск
+### Run
 
 ```bash
 git clone https://github.com/hzname/coordinate-validator.git
@@ -64,6 +75,22 @@ go run ./cmd/server
 
 ## gRPC API
 
+### Validation (Refinement - NO learning)
+
+```protobuf
+rpc Validate(CoordinateRequest) returns (CoordinateResponse);
+rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
+```
+
+### Learning (separate stream)
+
+```protobuf
+rpc LearnFromCoordinates(LearnRequest) returns (LearnResponse);
+rpc GetCompanionSources(GetCompanionsRequest) returns (GetCompanionsResponse);
+```
+
+### Request/Response
+
 ```protobuf
 message CoordinateRequest {
   string device_id = 1;
@@ -72,11 +99,11 @@ message CoordinateRequest {
   float accuracy = 4;
   int64 timestamp = 5;
   
-  // EGTS_ENVELOPE_LOW (92)
+  // WiFi / BLE
   repeated WifiAccessPoint wifi = 6;
   repeated BluetoothDevice bluetooth = 7;
   
-  // EGTS_ENVELOPE_HIGHT (91)
+  // Cell towers
   repeated CellTower cell_towers = 8;
 }
 
@@ -88,7 +115,7 @@ message CoordinateResponse {
 }
 ```
 
-### Пример вызова
+### Example
 
 ```bash
 grpcurl -plaintext -d '{
@@ -102,33 +129,32 @@ grpcurl -plaintext -d '{
 }' localhost:50051 coordinate.CoordinateValidator/Validate
 ```
 
-## Конфигурация
+## Configuration
 
-| Переменная | Описание | По умолчанию |
-|-----------|----------|--------------|
-| SERVER_PORT | Порт gRPC сервера | 50051 |
-| REDIS_ADDR | Адрес Redis | localhost:6379 |
-| CLICKHOUSE_ADDR | Адрес ClickHouse | localhost:9000 |
-| CLICKHOUSE_DB | База данных | coordinates |
+| Variable | Description | Default |
+|---------|-------------|---------|
+| SERVER_PORT | gRPC server port | 50051 |
+| REDIS_ADDR | Redis address | localhost:6379 |
+| CLICKHOUSE_ADDR | ClickHouse address | localhost:9000 |
+| CLICKHOUSE_DB | Database | coordinates |
 
-## Лимиты валидации
+## Validation Limits
 
-- Максимальная скорость: 150 км/ч
-- Максимальное время отклонения: 12 часов
-- Веса источников данных:
-  - WiFi: 0.4
-  - Cell: 0.3
-  - Bluetooth: 0.3
+- Max speed: 150 km/h
+- Max time deviation: 12 hours
+- Triangulation: intersection of source areas
+- Companion detection: co-occurrence analysis
 
-## Документация
+## Documentation
 
-- [Архитектура](docs/architecture.md) - Диаграммы
+- [Architecture](docs/architecture.md) - System diagrams
+- [Learning Model](docs/learning-model.md) - Two-stream model, companion filter
 
-## Производительность
+## Performance
 
-- Пропускная способность: ~1000+ RPS
-- Задержка: <10ms
+- Throughput: ~1000+ RPS
+- Latency: <10ms
 
-## Лицензия
+## License
 
 MIT
