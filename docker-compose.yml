@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: coordinates
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "50051:50051"
+    depends_on:
+      - redis
+      - clickhouse
+    environment:
+      SERVER_PORT: "50051"
+      REDIS_ADDR: "redis:6379"
+      CLICKHOUSE_ADDR: "clickhouse:9000"
+      CLICKHOUSE_DB: "coordinates"
+    volumes:
+      - ./proto:/app/proto
+
+volumes:
+  redis_data:
+  clickhouse_data:

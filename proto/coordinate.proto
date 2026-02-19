@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package coordinate;
+
+option go_package = "pkg/pb";
+
+message CoordinateRequest {
+  string device_id = 1;
+  double latitude = 2;
+  double longitude = 3;
+  float accuracy = 4;
+  int64 timestamp = 5;
+  
+  // Optional: WiFi access points
+  repeated WifiAccessPoint wifi = 6;
+  
+  // Optional: Bluetooth devices
+  repeated BluetoothDevice bluetooth = 7;
+  
+  // Optional: Cell tower info
+  CellTower cell_tower = 8;
+}
+
+message WifiAccessPoint {
+  string ssid = 1;
+  string bssid = 2;
+  int32 signal_strength = 3;
+}
+
+message BluetoothDevice {
+  string mac = 1;
+  int32 rssi = 2;
+}
+
+message CellTower {
+  string cell_id = 1;
+  int32 lac = 2;
+  int32 mcc = 3;
+  int32 mnc = 4;
+  int32 signal_strength = 5;
+}
+
+message CoordinateResponse {
+  ValidationResult result = 1;
+  float confidence = 2;  // 0.0 - 1.0
+  float estimated_accuracy = 3;
+  string reason = 4;     // Optional: explanation
+}
+
+enum ValidationResult {
+  VALID = 0;
+  INVALID = 1;
+  UNCERTAIN = 2;
+}
+
+// Stream for batch processing (optional)
+service CoordinateValidator {
+  rpc Validate(CoordinateRequest) returns (CoordinateResponse);
+  rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
+}
