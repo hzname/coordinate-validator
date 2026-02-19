@@ -1,419 +1,316 @@
 # Coordinate Validator - Модель данных
 
-## Три типа координат
+## Новая концепция: Триангуляция
 
-### 1. ABSOLUTE (Абсолютные)
-**Источник:** Надёжный API (высокоточные данные)
+### Старая модель (веса)
+```
+Итог = WiFi*0.4 + Cell*0.3 + BLE*0.3
+```
+❌ Не учитывает взаимосвязи между источниками
 
-| Поле | Описание |
-|------|----------|
-| point_id | BSSID / Cell ID / MAC |
-| point_type | wifi / cell |
-| latitude | Абсолютная широта |
-| longitude | Абсолютная долгота |
-| accuracy | Точность источника |
-| source | Источник (gps_raw, glonass, etc) |
-| timestamp | Время получения |
-| expires_at | Срок действия |
+### Новая модель (пересечение)
+```
+WiFi (BSSID) ──────┐
+                    │      ┌── Пересечение #1
+Cell Tower ─────────┼──────┤
+                    │      └── Пересечение #2
+BLE Device ─────────┘
 
-### 2. CALCULATED (Вычисленные)
-**Источник:** Расчёт при обучении
-
-| Поле | Описание |
-|------|----------|
-| point_id | BSSID / Cell ID / MAC |
-| point_type | wifi / cell |
-| latitude | Вычисленная широта |
-| longitude | Вычисленная долгота |
-| confidence | Уверенность (0-1) |
-| observations | Кол-во наблюдений |
-| calculated_at | Время расчёта |
-| valid_until | Действительно до |
-
-### 3. DEVIATION (Отклонения)
-**Источник:** Текущие измерения
-
-| Поле | Описание |
-|------|----------|
-| point_id | BSSID / Cell ID / MAC |
-| point_type | wifi / cell |
-| latitude | Текущая широта |
-| longitude | Текущая долгота |
-| deviation | Отклонение в метрах |
-| measured_at | Время измерения |
+Финальная позиция = центр пересечения всех областей
+```
 
 ---
 
-## Адаптивные пороги
+## Алгоритм определения позиции
 
-Пороги зависят от количества видимых источников (сигналов):
+### 1. Для каждого источника — радиус неопределённости
 
-### Формула расчёта порогов
+| Источник | Точность | Радиус |
+|----------|---------|--------|
+| GPS | 5-50м | 50м |
+| Cell (MCC+MNC+LAC) | 300м - 3км | 3000м |
+| Cell (с ATC) | 50-300м | 300м |
+| WiFi (BSSID) | 20-50м | 50м |
+| BLE (MAC) | 5-15м | 15м |
 
-```
-BASE_THRESHOLD = 50  # метров
-SOURCES_WEIGHT = 10  # метров на источник
-
-THRESHOLD = BASE_THRESHOLD + (SOURCES_WEIGHT * (TOTAL_SOURCES - 1))
-```
-
-### Таблица порогов
-
-| Кол-во источников | ABSOLUTE_THRESHOLD | DEVIATION_UPDATE |
-|------------------|-------------------|------------------|
-| 1 | 50 м | 100 м |
-| 2 | 60 м | 120 м |
-| 3 | 70 м | 140 м |
-| 4 | 80 м | 160 м |
-| 5+ | 90 м | 180 м |
-
-**Чем больше источников → тем выше порог** (больше уверенность в результате)
-
----
-
-## Фильтр мобильных устройств
-
-### Проблема
-WiFi/BLE источники могут быть **мобильными** (перемещаются вместе с объектом):
-- Смартфоны
-- Bluetooth наушники
-- Умные часы
-- Ноутбуки
-- Персональные хотспоты
-
-### Решение: Фильтрация
-
-#### Признаки мобильного устройства:
-
-| Признак | WiFi | BLE |
-|---------|------|-----|
-| SSID содержит | "iPhone", "Android", "Galaxy", "Xiaomi", "Huawei" | - |
-| MAC префикс | - | Известные OUI мобильных |
-| Имя (для BLE) | - | "AirPods", "Galaxy Buds", "Watch", "iWatch" |
-| RSSI паттерн | Быстрое изменение | Быстрое изменение |
-
-#### Фильтр OUI (Bluetooth MAC)
-
-```go
-// Известные производители мобильных устройств
-var mobileOUI = []string{
-    "00:1A:2B", // Generic
-    "00:1B:44", // Samsung
-    "00:1E:7D", // Apple
-    "00:26:08", // Apple
-    "00:25:00", // Apple
-    "00:25:4B", // Apple
-    "00:26:B0", // Apple
-    "00:26:BB", // Apple
-    "3C:5A:B4", // Google
-    "00:11:22", // Generic Android
-    "F0:18:98", // Apple
-    "A4:5E:CB", // Apple
-    "7C:D1:C3", // Apple
-    "44:07:0B", // Google
-    "48:A9:1C", // Samsung
-    "50:01:BB", // Samsung
-    "9C:20:7B", // Samsung
-}
-```
-
-#### Фильтр SSID (WiFi)
-
-```go
-// Паттерны мобильных SSID
-var mobileSSIDPatterns = []string{
-    "iPhone",
-    "Android",
-    "Galaxy",
-    "Xiaomi",
-    "Huawei",
-    "Redmi",
-    "POCO",
-    "OPPO",
-    "Vivo",
-    "OnePlus",
-    "Realme",
-    "iPad",
-    "MacBook",
-    "HUAWEI",
-    "MI",
-    "Redmi",
-    "SM-",      // Samsung mobile
-    "iPhone",   // Apple
-    "iPad",     // Apple
-}
-
-var trustedSSIDPatterns = []string{
-    "Home", "Work", "Office",
-    "WiFi", "Guest",
-    "Coffee", "Cafe", "Restaurant",
-    "Store", "Shop",
-}
-```
-
-### Алгоритм фильтрации
+### 2. Модель пересечения
 
 ```mermaid
 flowchart TD
-    Input[Получил WiFi/BLE данные] --> Type{Тип?}
+    Input[Получил данные<br/>Координаты + источники] --> Groups[Группировка по типу]
     
-    Type -->|WiFi| WifiCheck[Проверить SSID]
-    Type -->|BLE| BleCheck[Проверить MAC]
+    Groups --> WifiGroup[WiFi: BSSID1, BSSID2...]
+    Groups --> CellGroup[Cell: CellID1, CellID2...]
+    Groups --> BleGroup[BLE: MAC1, MAC2...]
     
-    WifiCheck --> WifiMobile{Мобильный<br/>SSID?}
-    WifiCheck --> WifiTrusted{Доверенный<br/>SSID?}
+    WifiGroup --> WifiCalc[Для каждого BSSID:<br/>получить ABSOLUTE/CALCULATED]
+    CellGroup --> CellCalc[Для каждого Cell:<br/>получить ABSOLUTE/CALCULATED]
+    BleGroup --> BleCalc[Для каждого MAC:<br/>получить ABSOLUTE/CALCULATED]
     
-    WifiMobile -->|Да| Exclude[ИСКЛЮЧИТЬ]
-    WifiMobile -->|Нет| Include1[ВКЛЮЧИТЬ]
+    WifiCalc --> WifiArea[Область #1:<br/>точка ± радиус]
+    CellCalc --> CellArea[Область #2:<br/>точка ± радиус]
+    BleCalc --> BleArea[Область #3:<br/>точка ± радиус]
     
-    WifiTrusted -->|Да| Include2[ВКЛЮЧИТЬ]
-    WifiTrusted -->|Нет| AnalyzeRSSI[Анализ RSSI]
+    WifiArea --> Intersect{Есть<br/>пересечение?}
+    CellArea --> Intersect
+    BleArea --> Intersect
     
-    BleCheck --> BleMobile{Мобильный<br/>OUI?}
-    BleCheck --> BleName{Известное<br/>имя?}
+    Intersect -->|Да| Center[Центр<br/>пересечения]
+    Intersect -->|Нет| Weighted[Усреднение<br/>по расстоянию]
     
-    BleMobile -->|Да| Exclude
-    BleMobile -->|Нет| Include3[ВКЛЮЧИТЬ]
-    
-    BleName -->|Да| Exclude
-    BleName -->|Нет| AnalyzeRSSI
-    
-    AnalyzeRSSI{RSSI быстро<br/>изменяется?}
-    AnalyzeRSSI -->|Да| Exclude
-    AnalyzeRSSI -->|Нет| Include4[ВКЛЮЧИТЬ]
+    Center --> Result[Финальная позиция]
+    Weighted --> Result
 ```
 
-### Конфигурация фильтра
+### 3. Формула центра пересечения
+
+```
+Для 2 кругов:
+  d = расстояние между центрами
+  r1, r2 = радиусы
+  
+  Если d > r1 + r2: нет пересечения
+  Если d < |r1 - r2|: один внутри другого
+  
+  Иначе:
+    a = (r1² - r2² + d²) / (2d)
+    h = √(r1² - a²)
+    
+    Центр пересечения:
+      x = x1 + a*(x2-x1)/d ± h*(y2-y1)/d
+      y = y1 + a*(y2-y1)/d ∓ h*(x2-x1)/d
+```
+
+---
+
+## Обновлённая модель данных
+
+### 1. ABSOLUTE — НЕ участвуют в обучении
+
+```
+ABSOLUTE — только для справочных данных
+При наличии ABSOLUTE:
+  - Используется для валидации
+  - НЕ записывается в CALCULATED
+  - НЕ участвует в обучении
+```
+
+### 2. CALCULATED — вычисленные из обучения
+
+```
+Только из наблюдений БЕЗ ABSOLUTE
+```
+
+### 3. DEVIATION — отклонения
+
+```
+Записываются:
+- Только от источников БЕЗ ABSOLUTE
+- Для анализа качества CALCULATED
+- Для обновления CALCULATED
+```
+
+---
+
+## Flow валидации (обновлённый)
+
+```mermaid
+flowchart TD
+    Start[Получил координаты] --> Filter[Фильтр мобильных<br/>устройств]
+    
+    Filter --> Groups{Есть источники<br/>без ABSOLUTE?}
+    
+    Groups -->|Да| Process[Обработать]
+    Groups -->|Нет| UseAbsolute[Использовать<br/>ABSOLUTE]
+    
+    Process --> GetSources[Получить CALCULATED<br/>для каждого источника]
+    
+    GetSources --> BuildAreas[Построить области<br/>неопределённости]
+    
+    BuildAreas --> FindIntersect{Найти<br/>пересечение?}
+    
+    FindIntersect -->|Да| CalcCenter[Центр<br/>пересечения]
+    FindIntersect -->|Нет| CalcWeighted[Усреднение<br/>по весам расстояния]
+    
+    CalcCenter --> Validate[Валидация:<br/>сравнить с входящими]
+    CalcWeighted --> Validate
+    
+    Validate --> CheckDeviation{Отклонение<br/>< порог?}
+    
+    CheckDeviation -->|Да| Valid[VALID<br/>confidence = 1 - deviation/max]
+    CheckDeviation -->|Нет| Uncertain[UNCERTAIN<br/>записать DEVIATION]
+    
+    UseAbsolute --> FinalResult[VALID<br/>confidence = 1.0]
+    
+    Valid --> Save[Сохранить: только DEVIATION<br/>НЕ обучать]
+    Uncertain --> Save
+    FinalResult --> End[Ответ]
+    
+    Save --> End
+```
+
+---
+
+## Обновлённый алгоритм обучения
+
+### Принцип: Только "сырые" данные
+
+```
+Входные данные:
+  - lat, lon, accuracy (от устройства)
+  - sources: WiFi[], Cell[], BLE[]
+
+Для каждого source (WiFi/BLE/Cell):
+  1. Есть ABSOLUTE для этого source?
+     │
+     ├─ ДА: Пропустить (не обучаем)
+     └─ НЕТ:
+        ├─ Есть CALCULATED?
+        │   ├─ ДА: Записать DEVIATION, проверить обновление
+        │   └─ НЕТ: Создать CALCULATED
+```
+
+### Обновление CALCULATED
+
+```
+DEVIATION_HISTORY = [d1, d2, d3, ... dn]  (последние N)
+
+avg_deviation = mean(DEVIATION_HISTORY)
+max_deviation = max(DEVIATION_HISTORY)
+
+ЕСЛИ avg_deviation < THRESHOLD:
+    CALCULATED = обновить (усреднение)
+ИНАЧЕ:
+    CALCULATED = оставить как есть
+    (источник ненадёжен)
+```
+
+---
+
+## Конфигурация
 
 ```yaml
+positioning:
+  # Радиусы неопределённости по источникам
+  radius:
+    wifi: 50        # метров
+    ble: 15         # метров  
+    cell_lac: 3000  # метров (только LAC)
+    cell_atc: 300   # метров (с ATC)
+  
+  # Минимум источников для пересечения
+  min_sources: 2
+  
+  # Пороги для обновления CALCULATED
+  learning:
+    deviation_threshold: 50    # метров
+    min_observations: 3
+    max_history: 10
+
+# Фильтр мобильных устройств
 filter:
-  # BLE MAC OUI для исключения (мобильные устройства)
   ble_exclude_oui:
-    - "00:1A:2B"  # Generic mobile
     - "00:1E:7D"  # Apple
     - "3C:5A:B4"  # Google
-    
-  # WiFi SSID паттерны для исключения
+    # ...
   wifi_exclude_patterns:
     - "iPhone*"
     - "Android*"
     - "Galaxy*"
-    - "*iPad*"
-    - "*MacBook*"
-    
-  # WiFi SSID паттерны для включения (доверенные)
-  wifi_trusted_patterns:
-    - "Home*"
-    - "Work*"
-    - "Office*"
-    - "*Coffee*"
-    
-  # Минимальный RSSI для inclusion
-  min_rssi: -85  # dBm
-  
-  # Анализ RSSI: исключить если изменение > X за Y секунд
-  rssi_change_threshold: 10  # dBm
-  rssi_change_window: 60     # секунд
-```
-
----
-
-## Flow обучения
-
-```mermaid
-flowchart TD
-    subgraph Input["Вход"]
-        NewData[Новые данные<br/>lat, lon, accuracy]
-        Sources[Кол-во источников<br/>N]
-    end
-
-    subgraph CalcThresholds["Расчёт порогов"]
-        Sources --> Thresh[THRESHOLD = 50 + (N-1)*10]
-    end
-
-    subgraph Filter["Фильтрация"]
-        NewData --> MobileCheck{Мобильное<br/>устройство?}
-        MobileCheck -->|Да| Skip[Пропустить]
-        MobileCheck -->|Нет| Process[Обработать]
-    end
-
-    subgraph Check["Проверка типа"]
-        Process --> HasAbsolute{Есть<br/>ABSOLUTE?}
-    end
-
-    subgraph Absolute["ABSOLUTE путь"]
-        A1[Получить ABSOLUTE]
-        A2[Рассчитать DEVIATION<br/>от ABSOLUTE]
-        A3{DEVIATION<br/>< THRESHOLD?}
-        A3 -->|Да| A4[Обновить CALCULATED]
-        A3 -->|Нет| A5[Записать DEVIATION]
-    end
-
-    subgraph Calc["CALCULATED путь"]
-        C1[Получить CALCULATED]
-        C2[Рассчитать DEVIATION<br/>от CALCULATED]
-        C3{DEVIATION<br/>> DEVIATION_UPDATE?}
-        C3 -->|Да| C4[Записать DEVIATION]
-        C3 -->|Нет| C5{Наблюдений<br/>> 3?}
-        C5 -->|Да| C6[Обновить CALCULATED]
-        C5 -->|Нет| C7[Записать DEVIATION]
-    end
-
-    subgraph NoData["Нет данных"]
-        N1[Нет ABSOLUTE<br/>Нет CALCULATED]
-        N2[Создать CALCULATED<br/>из первых данных]
-    end
-
-    HasAbsolute -->|Да| A1
-    HasAbsolute -->|Нет| C1
-    C1 -->|Нет CALCULATED| N1
-    N1 --> N2
-    
-    A4 --> End[Записать в БД]
-    A5 --> End
-    C6 --> End
-    C7 --> End
-    N2 --> End
-    Skip --> End
-```
-
----
-
-## Redis структура
-
-```
-# ABSOLUTE координаты (приоритет)
-absolute:{type}:{id} → {
-    lat, lon, accuracy, source, 
-    timestamp, expires_at
-}
-
-# Вычисленные координаты  
-calculated:{type}:{id} → {
-    lat, lon, confidence, observations,
-    calculated_at, valid_until
-}
-
-# Текущие отклонения (для накопления)
-deviation:{type}:{id} → {
-    lat, lon, deviation_meters,
-    measured_at
-}
-
-# История отклонений
-deviation_history:{type}:{id} → [
-    {lat, lon, deviation, measured_at},
-    ...
-]
-
-# Фильтр: исключённые точки
-excluded:{type}:{id} → {
-    reason: "mobile_ble" | "mobile_wifi" | "rssi_unstable",
-    detected_at
-}
-```
-
----
-
-## API
-
-### Существующие методы
-
-```protobuf
-service CoordinateValidator {
-    // Валидация координат
-    rpc Validate(CoordinateRequest) returns (CoordinateResponse);
-    
-    // Batch валидация
-    rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
-}
-```
-
-### Новые методы (отдельный сервис для ABSOLUTE)
-
-```protobuf
-service AbsoluteCoordinates {
-    // Добавить абсолютные координаты (от надёжного источника)
-    rpc SetAbsoluteCoordinates(AbsoluteRequest) returns (AbsoluteResponse);
-    
-    // Удалить абсолютные координаты
-    rpc RemoveAbsoluteCoordinates(RemoveRequest) returns (RemoveResponse);
-    
-    // Получить информацию о точке
-    rpc GetPointInfo(PointRequest) returns (PointInfoResponse);
-    
-    // Получить список исключённых точек
-    rpc GetExcludedPoints(ExcludedRequest) returns (ExcludedResponse);
-}
-
-message AbsoluteRequest {
-    string point_id = 1;
-    PointType point_type = 2;
-    double latitude = 3;
-    double longitude = 4;
-    float accuracy = 5;
-    string source = 6;      // "gps_raw", "glonass", "manual", "rtk"
-    int64 expires_at = 7;    // Unix timestamp
-}
-
-message PointRequest {
-    string point_id = 1;
-    PointType point_type = 2;
-}
-
-message PointInfoResponse {
-    AbsoluteCoordinates absolute = 1;
-    CalculatedCoordinates calculated = 2;
-    repeated DeviationRecord deviations = 3;
-    bool is_excluded = 4;
-    string exclusion_reason = 5;
-}
-
-message ExcludedRequest {
-    PointType point_type = 1;
-    int32 limit = 2;
-}
 ```
 
 ---
 
 ## Примеры
 
-### Пример 1: Фильтрация iPhone
+### Пример 1: Пересечение WiFi + Cell
 
 ```
-Вход:
-  WiFi BSSID: "AA:BB:CC:DD:EE:FF"
-  SSID: "iPhone"
-  lat: 55.7558, lon: 37.6173
+Входные данные:
+  GPS: lat=55.7558, lon=37.6173
+  WiFi BSSID1: AA:BB:CC:DD:EE:FF → CALCULATED: 55.7555, 37.6170 (радиус 50м)
+  Cell CID=12345, LAC=678 → CALCULATED: 55.7560, 37.6180 (радиус 300м)
 
-Фильтр:
-  SSID "iPhone" содержит паттерн "iPhone" → мобильный
+Области:
+  - WiFi: круг (55.7555, 37.6170, r=50м)
+  - Cell: круг (55.7560, 37.6180, r=300м)
+
+Пересечение: ЕСТЬ
+
+Центр пересечения: 55.7557, 37.6172
+
+Сравнение с GPS:
+  distance = 14м
+  deviation = 14м < 50м → VALID
+```
+
+### Пример 2: Нет пересечения
+
+```
+Входные данные:
+  GPS: lat=55.7558, lon=37.6173
+  WiFi BSSID1: → CALCULATED: 55.7520, 37.6100 (радиус 50м) — далеко!
+  Cell: → CALCULATED: 55.7600, 37.6200 (радиус 300м)
+
+Области НЕ пересекаются (d > r1 + r2)
+
+Решение: Усреднение по расстоянию до центра
+  - Вес WiFi: 1/50 = 0.02
+  - Вес Cell: 1/300 = 0.003
   
-Результат:
-  Точка ИСКЛЮЧЕНА (reason: "mobile_wifi")
-  Не записывается в Redis/ClickHouse
+  Итог = (WiFi * 0.02 + Cell * 0.003) / (0.02 + 0.003)
 ```
 
-### Пример 2: Адаптивные пороги
+### Пример 3: ABSOLUTE — не обучаем
 
 ```
-Сценарий A: 1 источник (Cell tower)
-  - ABSOLUTE_THRESHOLD = 50 + (1-1)*10 = 50м
-  - DEVIATION_UPDATE = 100м
+Входные данные:
+  GPS: lat=55.7558, lon=37.6173
+  WiFi BSSID1: → ABSOLUTE: 55.7555, 37.6170 (от надёжного API)
 
-Сценарий B: 5 источников (1 Cell + 4 WiFi)
-  - ABSOLUTE_THRESHOLD = 50 + (5-1)*10 = 90м
-  - DEVIATION_UPDATE = 180м
+Для этого WiFi:
+  - ABSOLUTE ЕСТЬ → ПРОПУСК
+  - НЕ создаём CALCULATED
+  - НЕ записываем DEVIATION
   
-Вывод: больше источников → выше порог → больше допустимое отклонение
+Используем ABSOLUTE для валидации
 ```
 
-### Пример 3: Обновление CALCULATED
+---
 
+## API (без изменений)
+
+```protobuf
+service CoordinateValidator {
+    rpc Validate(CoordinateRequest) returns (CoordinateResponse);
+    rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
+}
+
+service AbsoluteCoordinates {
+    rpc SetAbsoluteCoordinates(AbsoluteRequest) returns (AbsoluteResponse);
+    rpc RemoveAbsoluteCoordinates(RemoveRequest) returns (RemoveResponse);
+    rpc GetPointInfo(PointRequest) returns (PointInfoResponse);
+}
 ```
-1. ABSOLUTE: lat=55.7558, lon=37.6173, accuracy=5m
-2. 3 наблюдения: 55.7560, 55.7559, 55.7557 (отклонения 22м, 11м, 12м)
-3. Среднее отклонение < 50м
-4. CALCULATED = lat=55.7559, lon=37.6174, confidence=0.85
-```
+
+---
+
+## Резюме изменений
+
+| Старое | Новое |
+|--------|-------|
+| Веса: WiFi 0.4, Cell 0.3, BLE 0.3 | Пересечение областей |
+| Все источники участвуют в обучении | ABSOLUTE — НЕ участвуют |
+| CALCULATED обновляется всегда | CALCULATED обновляется только при avg_deviation < порог |
+
+---
+
+## Следующие шаги
+
+1. ✅ Фильтр мобильных устройств
+2. ✅ Адаптивные пороги
+3. ✅ Триангуляция / пересечение
+4. ✅ ABSOLUTE — не обучаем
+5. ⏳ Реализация кода
+
+Всё устраивает? Начинаем кодить? 🚕
