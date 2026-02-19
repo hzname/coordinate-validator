@@ -4,6 +4,10 @@ package coordinate;
 
 option go_package = "pkg/pb";
 
+// ============================================
+// Coordinate Request/Response
+// ============================================
+
 message CoordinateRequest {
   string device_id = 1;
   double latitude = 2;
@@ -11,21 +15,18 @@ message CoordinateRequest {
   float accuracy = 4;
   int64 timestamp = 5;
   
-  // EGTS_ENVELOPE_LOW (92) - WiFi / BLE
+  // WiFi / BLE (EGTS_ENVELOPE_LOW)
   repeated WifiAccessPoint wifi = 6;
   repeated BluetoothDevice bluetooth = 7;
   
-  // EGTS_ENVELOPE_HIGHT (91) - Cell towers
+  // Cell towers (EGTS_ENVELOPE_HIGHT)
   repeated CellTower cell_towers = 8;
-  
-  // Additional EGTS data
-  EgtsHeader egts_header = 9;
 }
 
 message WifiAccessPoint {
   string ssid = 1;
-  string bssid = 2;       // MAC address (CID from EGTS)
-  int32 rssi = 3;         // Signal strength (from EID, inverted)
+  string bssid = 2;
+  int32 rssi = 3;
 }
 
 message BluetoothDevice {
@@ -34,36 +35,346 @@ message BluetoothDevice {
 }
 
 message CellTower {
-  uint32 cell_id = 1;     // CID - base station ID
-  uint32 lac = 2;         // LAC - local area code
-  uint32 mcc = 3;         // MCC - mobile country code
-  uint32 mnc = 4;         // MNC - mobile network code
-  int32 rssi = 5;         // RSSI with +128 offset
-  int32 eid = 6;          // EID - inverted RSSI (*-1)
+  uint32 cell_id = 1;
+  uint32 lac = 2;
+  uint32 mcc = 3;
+  uint32 mnc = 4;
+  int32 rssi = 5;
 }
 
-message EgtsHeader {
-  string packet_id = 1;
-  int64 receipt_time = 2;
-}
-
-// Validation response
 message CoordinateResponse {
   ValidationResult result = 1;
-  float confidence = 2;  // 0.0 - 1.0
+  float confidence = 2;
   float estimated_accuracy = 3;
-  string reason = 4;     // Explanation
+  string reason = 4;
 }
 
-// Validation results
 enum ValidationResult {
   VALID = 0;
   INVALID = 1;
   UNCERTAIN = 2;
 }
 
-// gRPC service
+// ============================================
+// Learning Request/Response
+// ============================================
+
+message LearnRequest {
+  string object_id = 1;
+  double latitude = 2;
+  double longitude = 3;
+  float accuracy = 4;
+  int64 timestamp = 5;
+  
+  repeated WifiAccessPoint wifi = 6;
+  repeated BluetoothDevice bluetooth = 7;
+  repeated CellTower cell_towers = 8;
+}
+
+message LearnResponse {
+  LearningResult result = 1;
+  repeated string stationary_sources = 2;
+  repeated string random_sources = 3;
+}
+
+enum LearningResult {
+  LEARNED = 0;
+  NEED_MORE_DATA = 1;
+  STATIONARY_DETECTED = 2;
+  RANDOM_EXCLUDED = 3;
+}
+
+message GetCompanionsRequest {
+  string object_id = 1;
+  PointType point_type = 2;
+}
+
+message GetCompanionsResponse {
+  repeated CompanionSource companions = 1;
+}
+
+message CompanionSource {
+  string point_id = 1;
+  PointType point_type = 2;
+  int32 observations = 3;
+  float stability = 4;
+  bool is_stationary = 5;
+  int64 first_seen = 6;
+  int64 last_seen = 7;
+}
+
+// ============================================
+// Absolute Coordinates (Reference Data)
+// ============================================
+
+message AbsoluteRequest {
+  string point_id = 1;
+  PointType point_type = 2;
+  double latitude = 3;
+  double longitude = 4;
+  float accuracy = 5;
+  string source = 6;
+  int64 expires_at = 7;
+}
+
+message AbsoluteResponse {
+  bool success = 1;
+}
+
+message RemoveRequest {
+  string point_id = 1;
+  PointType point_type = 2;
+}
+
+message RemoveResponse {
+  bool success = 1;
+}
+
+message PointRequest {
+  string point_id = 1;
+  PointType point_type = 2;
+}
+
+message PointInfoResponse {
+  AbsoluteCoordinates absolute = 1;
+  CalculatedCoordinates calculated = 2;
+  bool is_stationary = 3;
+  string stationary_reason = 4;
+}
+
+message AbsoluteCoordinates {
+  double latitude = 1;
+  double longitude = 2;
+  float accuracy = 3;
+  string source = 4;
+  int64 timestamp = 5;
+  int64 expires_at = 6;
+}
+
+message CalculatedCoordinates {
+  double latitude = 1;
+  double longitude = 2;
+  float confidence = 3;
+  int32 observations = 4;
+  int64 calculated_at = 5;
+}
+
+message ExcludedRequest {
+  PointType point_type = 1;
+  int32 limit = 2;
+}
+
+message ExcludedResponse {
+  repeated ExcludedSource sources = 1;
+}
+
+message ExcludedSource {
+  string point_id = 1;
+  PointType point_type = 2;
+  string reason = 3;
+  int64 detected_at = 4;
+}
+
+enum PointType {
+  POINT_TYPE_UNSPECIFIED = 0;
+  WIFI = 1;
+  CELL = 2;
+  BLE = 3;
+}
+
+// ============================================
+// Admin API - Configuration
+// ============================================
+
+message GetConfigRequest {
+  string category = 1;
+}
+
+message GetConfigResponse {
+  map<string, ConfigParameter> parameters = 1;
+}
+
+message ConfigParameter {
+  string key = 1;
+  string value = 2;
+  string default_value = 3;
+  string min_value = 4;
+  string max_value = 5;
+  string description = 6;
+  string category = 7;
+}
+
+message UpdateConfigRequest {
+  string key = 1;
+  string value = 2;
+  string reason = 3;
+}
+
+message UpdateConfigResponse {
+  bool success = 1;
+  string old_value = 2;
+  string new_value = 3;
+  int64 changed_at = 4;
+}
+
+message ResetConfigRequest {}
+
+message ResetConfigResponse {
+  bool success = 1;
+}
+
+message HistoryRequest {
+  string key = 1;
+  int32 limit = 2;
+}
+
+message HistoryResponse {
+  repeated ConfigChange changes = 1;
+}
+
+message ConfigChange {
+  string key = 1;
+  string old_value = 2;
+  string new_value = 3;
+  string reason = 4;
+  int64 changed_at = 5;
+}
+
+// ============================================
+// Metrics API
+// ============================================
+
+message OverviewRequest {
+  string time_range = 1;
+}
+
+message OverviewResponse {
+  int64 total_requests = 1;
+  int64 valid_count = 2;
+  int64 invalid_count = 3;
+  int64 uncertain_count = 4;
+  double valid_rate = 5;
+  double invalid_rate = 6;
+  double uncertain_rate = 7;
+}
+
+message TimeSeriesRequest {
+  string metric = 1;
+  string time_range = 2;
+  int64 interval_seconds = 3;
+}
+
+message TimeSeriesResponse {
+  repeated TimeSeriesPoint points = 1;
+}
+
+message TimeSeriesPoint {
+  int64 timestamp = 1;
+  double value = 2;
+}
+
+message LatencyRequest {
+  string time_range = 1;
+}
+
+message LatencyResponse {
+  double avg_ms = 1;
+  double p50_ms = 2;
+  double p95_ms = 3;
+  double p99_ms = 4;
+}
+
+// ============================================
+// Statistics API
+// ============================================
+
+message SourceStatsRequest {}
+
+message SourceStatsResponse {
+  repeated SourceTypeStats stats = 1;
+}
+
+message SourceTypeStats {
+  PointType point_type = 1;
+  int64 total = 2;
+  int64 stationary = 3;
+  int64 random = 4;
+  double coverage = 5;
+}
+
+message TopSourcesRequest {
+  PointType point_type = 1;
+  int32 limit = 2;
+  bool stationary_only = 3;
+}
+
+message TopSourcesResponse {
+  repeated SourceInfo sources = 1;
+}
+
+message SourceInfo {
+  string point_id = 1;
+  PointType point_type = 2;
+  int32 observations = 3;
+  float variance = 4;
+  bool is_stationary = 5;
+  int64 last_seen = 6;
+}
+
+message ProgressRequest {}
+
+message ProgressResponse {
+  int64 total_observations = 1;
+  int64 stationary_sources = 2;
+  double coverage_percent = 3;
+}
+
+message ObjectStatsRequest {}
+
+message ObjectStatsResponse {
+  int64 total_objects = 1;
+  int64 active_objects = 2;
+  int64 idle_objects = 3;
+  int64 offline_objects = 4;
+}
+
+// ============================================
+// Services
+// ============================================
+
 service CoordinateValidator {
   rpc Validate(CoordinateRequest) returns (CoordinateResponse);
   rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);
+}
+
+service LearningService {
+  rpc LearnFromCoordinates(LearnRequest) returns (LearnResponse);
+  rpc GetCompanionSources(GetCompanionsRequest) returns (GetCompanionsResponse);
+}
+
+service AbsoluteCoordinates {
+  rpc SetAbsoluteCoordinates(AbsoluteRequest) returns (AbsoluteResponse);
+  rpc RemoveAbsoluteCoordinates(RemoveRequest) returns (RemoveResponse);
+  rpc GetPointInfo(PointRequest) returns (PointInfoResponse);
+  rpc GetExcludedPoints(ExcludedRequest) returns (ExcludedResponse);
+}
+
+service AdminService {
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc ResetConfig(ResetConfigRequest) returns (ResetConfigResponse);
+  rpc GetConfigHistory(HistoryRequest) returns (HistoryResponse);
+}
+
+service MetricsService {
+  rpc GetOverview(OverviewRequest) returns (OverviewResponse);
+  rpc GetTimeSeries(TimeSeriesRequest) returns (TimeSeriesResponse);
+  rpc GetLatencyStats(LatencyRequest) returns (LatencyResponse);
+}
+
+service StatisticsService {
+  rpc GetSourceStats(SourceStatsRequest) returns (SourceStatsResponse);
+  rpc GetTopSources(TopSourcesRequest) returns (TopSourcesResponse);
+  rpc GetLearningProgress(ProgressRequest) returns (ProgressResponse);
+  rpc GetObjectStats(ObjectStatsRequest) returns (ObjectStatsResponse);
 }
