@@ -15,23 +15,33 @@ type RedisCache struct {
 	client *redis.Client
 }
 
+// EGTS data structures
 type WifiPoint struct {
 	Lat       float64   `json:"lat"`
 	Lon       float64   `json:"lon"`
 	LastSeen  time.Time `json:"last_seen"`
 	Count     int       `json:"count"`
+	// EGTS fields
+	SSID      string    `json:"ssid,omitempty"`
+	EID       int32     `json:"eid,omitempty"` // Inverted RSSI
 }
 
 type CellPoint struct {
 	Lat       float64   `json:"lat"`
 	Lon       float64   `json:"lon"`
 	LastSeen  time.Time `json:"last_seen"`
+	// EGTS fields
+	LAC       uint32    `json:"lac,omitempty"`
+	MCC       uint32    `json:"mcc,omitempty"`
+	MNC       uint32    `json:"mnc,omitempty"`
+	EID       int32     `json:"eid,omitempty"` // Inverted RSSI
 }
 
 type BluetoothPoint struct {
 	Lat       float64   `json:"lat"`
 	Lon       float64   `json:"lon"`
 	LastSeen  time.Time `json:"last_seen"`
+	EID       int32     `json:"eid,omitempty"` // Inverted RSSI
 }
 
 type LastKnownLocation struct {
@@ -62,7 +72,8 @@ func (r *RedisCache) Close() error {
 	return r.client.Close()
 }
 
-// WiFi methods
+// ============ WiFi methods (EGTS_ENVELOPE_LOW, type=0) ============
+
 func (r *RedisCache) GetWifiPoint(ctx context.Context, bssid string) (*WifiPoint, error) {
 	key := fmt.Sprintf("wifi:%s", bssid)
 	data, err := r.client.Get(ctx, key).Bytes()
@@ -89,9 +100,10 @@ func (r *RedisCache) SetWifiPoint(ctx context.Context, bssid string, point *Wifi
 	return r.client.Set(ctx, key, data, 30*24*time.Hour).Err()
 }
 
-// Cell tower methods
-func (r *RedisCache) GetCellPoint(ctx context.Context, cellID string, lac int) (*CellPoint, error) {
-	key := fmt.Sprintf("cell:%s:%d", cellID, lac)
+// ============ Cell tower methods (EGTS_ENVELOPE_HIGHT) ============
+
+func (r *RedisCache) GetCellPoint(ctx context.Context, cellID uint32, lac uint32) (*CellPoint, error) {
+	key := fmt.Sprintf("cell:%d:%d", cellID, lac)
 	data, err := r.client.Get(ctx, key).Bytes()
 	if err == redis.Nil {
 		return nil, nil
@@ -107,8 +119,8 @@ func (r *RedisCache) GetCellPoint(ctx context.Context, cellID string, lac int) (
 	return &point, nil
 }
 
-func (r *RedisCache) SetCellPoint(ctx context.Context, cellID string, lac int, point *CellPoint) error {
-	key := fmt.Sprintf("cell:%s:%d", cellID, lac)
+func (r *RedisCache) SetCellPoint(ctx context.Context, cellID uint32, lac uint32, point *CellPoint) error {
+	key := fmt.Sprintf("cell:%d:%d", cellID, lac)
 	data, err := json.Marshal(point)
 	if err != nil {
 		return err
@@ -116,7 +128,33 @@ func (r *RedisCache) SetCellPoint(ctx context.Context, cellID string, lac int, p
 	return r.client.Set(ctx, key, data, 30*24*time.Hour).Err()
 }
 
-// Bluetooth methods
+// Get cell by LAC+MCC+MNC (broader search)
+func (r *RedisCache) GetCellByLAC(ctx context.Context, lac, mcc, mnc uint32) ([]CellPoint, error) {
+	pattern := fmt.Sprintf("cell:*:%d", lac)
+	keys, err := r.client.Keys(ctx, pattern).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var points []CellPoint
+	for _, key := range keys {
+		data, err := r.client.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		var point CellPoint
+		if err := json.Unmarshal(data, &point); err != nil {
+			continue
+		}
+		if point.MCC == mcc && point.MNC == mnc {
+			points = append(points, point)
+		}
+	}
+	return points, nil
+}
+
+// ============ Bluetooth methods (EGTS_ENVELOPE_LOW, type=1) ============
+
 func (r *RedisCache) GetBluetoothPoint(ctx context.Context, mac string) (*BluetoothPoint, error) {
 	key := fmt.Sprintf("bt:%s", mac)
 	data, err := r.client.Get(ctx, key).Bytes()
@@ -143,7 +181,8 @@ func (r *RedisCache) SetBluetoothPoint(ctx context.Context, mac string, point *B
 	return r.client.Set(ctx, key, data, 30*24*time.Hour).Err()
 }
 
-// Last known location for device
+// ============ Device last known location ============
+
 func (r *RedisCache) GetLastKnownLocation(ctx context.Context, deviceID string) (*LastKnownLocation, error) {
 	key := fmt.Sprintf("device:%s:last_known", deviceID)
 	data, err := r.client.Get(ctx, key).Bytes()
@@ -167,6 +206,22 @@ func (r *RedisCache) SetLastKnownLocation(ctx context.Context, deviceID string, 
 	if err != nil {
 		return err
 	}
-	// Keep for 7 days
 	return r.client.Set(ctx, key, data, 7*24*time.Hour).Err()
+}
+
+// ============ EGTS helper: convert EID to RSSI ============
+
+// EID in EGTS is inverted RSSI (* -1), need to convert back
+// RSSI = -EID (or EID + 128 for some cases)
+func ConvertEIDToRSSI(eid int32) int32 {
+	rssi := -eid
+	if rssi < -128 {
+		rssi += 128 // Handle offset
+	}
+	return rssi
+}
+
+// RSSI in EGTS comes as offset (+128), convert to normal
+func ConvertEGTSRSSI(rssi byte) int32 {
+	return int32(int8(rssi)) // Convert from offset
 }

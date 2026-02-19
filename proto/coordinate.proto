@@ -11,20 +11,21 @@ message CoordinateRequest {
   float accuracy = 4;
   int64 timestamp = 5;
   
-  // Optional: WiFi access points
+  // EGTS_ENVELOPE_LOW (92) - WiFi / BLE
   repeated WifiAccessPoint wifi = 6;
-  
-  // Optional: Bluetooth devices
   repeated BluetoothDevice bluetooth = 7;
   
-  // Optional: Cell tower info
-  CellTower cell_tower = 8;
+  // EGTS_ENVELOPE_HIGHT (91) - Cell towers
+  repeated CellTower cell_towers = 8;
+  
+  // Additional EGTS data
+  EgtsHeader egts_header = 9;
 }
 
 message WifiAccessPoint {
   string ssid = 1;
-  string bssid = 2;
-  int32 signal_strength = 3;
+  string bssid = 2;       // MAC address (CID from EGTS)
+  int32 rssi = 3;         // Signal strength (from EID, inverted)
 }
 
 message BluetoothDevice {
@@ -33,27 +34,35 @@ message BluetoothDevice {
 }
 
 message CellTower {
-  string cell_id = 1;
-  int32 lac = 2;
-  int32 mcc = 3;
-  int32 mnc = 4;
-  int32 signal_strength = 5;
+  uint32 cell_id = 1;     // CID - base station ID
+  uint32 lac = 2;         // LAC - local area code
+  uint32 mcc = 3;         // MCC - mobile country code
+  uint32 mnc = 4;         // MNC - mobile network code
+  int32 rssi = 5;         // RSSI with +128 offset
+  int32 eid = 6;          // EID - inverted RSSI (*-1)
 }
 
+message EgtsHeader {
+  string packet_id = 1;
+  int64 receipt_time = 2;
+}
+
+// Validation response
 message CoordinateResponse {
   ValidationResult result = 1;
   float confidence = 2;  // 0.0 - 1.0
   float estimated_accuracy = 3;
-  string reason = 4;     // Optional: explanation
+  string reason = 4;     // Explanation
 }
 
+// Validation results
 enum ValidationResult {
   VALID = 0;
   INVALID = 1;
   UNCERTAIN = 2;
 }
 
-// Stream for batch processing (optional)
+// gRPC service
 service CoordinateValidator {
   rpc Validate(CoordinateRequest) returns (CoordinateResponse);
   rpc ValidateBatch(stream CoordinateRequest) returns (stream CoordinateResponse);

@@ -13,7 +13,7 @@ import (
 )
 
 type ValidatorService struct {
-	cache    *cache.RedisCache
+	cache   *cache.RedisCache
 	storage  *storage.ClickHouseStorage
 	cfg      config.ValidationConfig
 	pb.UnimplementedCoordinateValidatorServer
@@ -25,9 +25,9 @@ func NewValidatorService(
 	cfg config.ValidationConfig,
 ) *ValidatorService {
 	return &ValidatorService{
-		cache: cache,
-		storage:  storage,
-		cfg:      cfg,
+		cache:  cache,
+		storage: storage,
+		cfg:     cfg,
 	}
 }
 
@@ -42,18 +42,16 @@ func (s *ValidatorService) Validate(ctx context.Context, req *pb.CoordinateReque
 	timeDiff := now.Sub(reqTime)
 
 	if timeDiff < 0 {
-		// Timestamp in the future
 		result = pb.ValidationResult_INVALID
 		reasons = append(reasons, "timestamp in the future")
 	} else if timeDiff > s.cfg.MaxTimeDiff {
-		// Timestamp too old
 		result = pb.ValidationResult_INVALID
 		reasons = append(reasons, fmt.Sprintf("timestamp too old: %v", timeDiff))
 	}
 
 	// 2. Speed validation (if we have previous location)
 	lastLoc, err := s.cache.GetLastKnownLocation(ctx, req.DeviceId)
-	if err == nil && lastLoc != nil {
+	if err == nil && lastLoc != nil && result != pb.ValidationResult_INVALID {
 		speed := calculateSpeedKmH(
 			lastLoc.Lat, lastLoc.Lon, lastLoc.Time,
 			req.Latitude, req.Longitude, reqTime,
@@ -65,18 +63,25 @@ func (s *ValidatorService) Validate(ctx context.Context, req *pb.CoordinateReque
 		}
 	}
 
-	// 3. WiFi validation (if available)
-	if len(req.Wifi) > 0 {
+	// 3. EGTS_ENVELOPE_LOW (92) - WiFi / BLE validation
+	if len(req.Wifi) > 0 && result != pb.ValidationResult_INVALID {
 		hasKnownWifi := false
 		for _, wifi := range req.Wifi {
+			// BSSID from EGTS is MAC address
 			wifiPoint, err := s.cache.GetWifiPoint(ctx, wifi.Bssid)
 			if err == nil && wifiPoint != nil {
 				// Known WiFi - boost confidence
 				confidence += s.cfg.WifiWeight * 0.3
 				hasKnownWifi = true
+				reasons = append(reasons, fmt.Sprintf("known WiFi: %s", wifi.Bssid))
 			} else {
-				// Unknown WiFi - record for learning
-				go s.recordWifiPoint(ctx, wifi.Bssid, req.Latitude, req.Longitude, req.Accuracy)
+				// Unknown WiFi - record for self-learning (EGTS)
+				// Convert EID to RSSI if present
+				rssi := wifi.Rssi
+				if rssi == 0 && wifi.Eid != 0 {
+					rssi = cache.ConvertEIDToRSSI(wifi.Eid)
+				}
+				go s.recordWifiPointFromEGTS(ctx, wifi.Bssid, wifi.Ssid, req.Latitude, req.Longitude, req.Accuracy, rssi)
 			}
 		}
 		if hasKnownWifi {
@@ -84,27 +89,39 @@ func (s *ValidatorService) Validate(ctx context.Context, req *pb.CoordinateReque
 		}
 	}
 
-	// 4. Cell tower validation (if available)
-	if req.CellTower != nil {
-		cellPoint, err := s.cache.GetCellPoint(ctx, req.CellTower.CellId, int(req.CellTower.Lac))
-		if err == nil && cellPoint != nil {
-			// Known cell tower - boost confidence
-			confidence += s.cfg.CellWeight * 0.3
-			reasons = append(reasons, "known cell tower found")
-		} else if req.CellTower.CellId != "" {
-			// Unknown cell - record for learning
-			go s.recordCellPoint(ctx, req.CellTower.CellId, int(req.CellTower.Lac), req.Latitude, req.Longitude)
-		}
-	}
-
-	// 5. Bluetooth validation (if available)
-	if len(req.Bluetooth) > 0 {
+	// 4. EGTS_ENVELOPE_LOW (92) - Bluetooth validation
+	if len(req.Bluetooth) > 0 && result != pb.ValidationResult_INVALID {
 		for _, bt := range req.Bluetooth {
 			btPoint, err := s.cache.GetBluetoothPoint(ctx, bt.Mac)
 			if err == nil && btPoint != nil {
 				confidence += s.cfg.BluetoothWeight * 0.3
-				reasons = append(reasons, "known Bluetooth device found")
+				reasons = append(reasons, fmt.Sprintf("known BLE: %s", bt.Mac))
 			}
+		}
+	}
+
+	// 5. EGTS_ENVELOPE_HIGHT (91) - Cell tower validation
+	if len(req.CellTowers) > 0 && result != pb.ValidationResult_INVALID {
+		hasKnownCell := false
+		for _, cell := range req.CellTowers {
+			// EGTS: CID = cell_id, LAC = local area code
+			cellPoint, err := s.cache.GetCellPoint(ctx, cell.CellId, cell.Lac)
+			if err == nil && cellPoint != nil {
+				// Known cell tower - boost confidence
+				confidence += s.cfg.CellWeight * 0.3
+				hasKnownCell = true
+				reasons = append(reasons, fmt.Sprintf("known cell: CID=%d LAC=%d", cell.CellId, cell.Lac))
+			} else {
+				// Unknown cell - record for self-learning (EGTS)
+				rssi := cell.Rssi
+				if rssi == 0 && cell.Eid != 0 {
+					rssi = cache.ConvertEIDToRSSI(cell.Eid)
+				}
+				go s.recordCellPointFromEGTS(ctx, cell.CellId, cell.Lac, cell.Mcc, cell.Mnc, req.Latitude, req.Longitude, rssi)
+			}
+		}
+		if hasKnownCell {
+			reasons = append(reasons, "known cell towers found")
 		}
 	}
 
@@ -121,19 +138,27 @@ func (s *ValidatorService) Validate(ctx context.Context, req *pb.CoordinateReque
 		confidence = 0
 	}
 
-	// Save to history
+	// Determine UNCERTAIN
+	if result == pb.ValidationResult_VALID && confidence < 0.5 {
+		result = pb.ValidationResult_UNCERTAIN
+		reasons = append(reasons, "low confidence")
+	}
+
+	// Save to history (async)
 	go s.saveToHistory(ctx, req, result, confidence)
 
 	// Update last known location
-	s.cache.SetLastKnownLocation(ctx, req.DeviceId, &cache.LastKnownLocation{
-		Lat:  req.Latitude,
-		Lon:  req.Longitude,
-		Time: reqTime,
-	})
+	if result != pb.ValidationResult_INVALID {
+		s.cache.SetLastKnownLocation(ctx, req.DeviceId, &cache.LastKnownLocation{
+			Lat:  req.Latitude,
+			Lon:  req.Longitude,
+			Time: reqTime,
+		})
+	}
 
 	response := &pb.CoordinateResponse{
 		Result:            result,
-		Confidence:        confidence,
+		Confidence:       confidence,
 		EstimatedAccuracy: req.Accuracy,
 	}
 	if len(reasons) > 0 {
@@ -162,9 +187,9 @@ func (s *ValidatorService) ValidateBatch(stream pb.CoordinateValidator_ValidateB
 	return nil
 }
 
-// Helper: calculate speed in km/h
+// ============ Helper functions ============
+
 func calculateSpeedKmH(lat1, lon1 float64, time1 time.Time, lat2, lon2 float64, time2 time.Time) float64 {
-	// Haversine distance
 	const R = 6371.0 // Earth's radius in km
 
 	dLat := toRad(lat2 - lat1)
@@ -176,11 +201,9 @@ func calculateSpeedKmH(lat1, lon1 float64, time1 time.Time, lat2, lon2 float64, 
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 
 	distance := R * c
-
-	// Time in hours
 	hours := time2.Sub(time1).Hours()
 	if hours <= 0 {
-		hours = 0.001 // avoid division by zero
+		hours = 0.001
 	}
 
 	return distance / hours
@@ -190,30 +213,36 @@ func toRad(deg float64) float64 {
 	return deg * math.Pi / 180
 }
 
-// Background: record new WiFi point
-func (s *ValidatorService) recordWifiPoint(ctx context.Context, bssid string, lat, lon float64, accuracy float32) {
+// ============ EGTS data recording (self-learning) ============
+
+func (s *ValidatorService) recordWifiPointFromEGTS(ctx context.Context, bssid, ssid string, lat, lon float64, accuracy float32, rssi int32) {
 	point := &cache.WifiPoint{
 		Lat:      lat,
 		Lon:      lon,
 		LastSeen: time.Now(),
 		Count:    1,
+		SSID:     ssid,
+		EID:      rssi,
 	}
 	s.cache.SetWifiPoint(ctx, bssid, point)
 	s.storage.UpdatePointStats(ctx, "wifi", bssid, lat, lon, accuracy)
 }
 
-// Background: record new cell tower
-func (s *ValidatorService) recordCellPoint(ctx context.Context, cellID string, lac int, lat, lon float64) {
+func (s *ValidatorService) recordCellPointFromEGTS(ctx context.Context, cellID, lac, mcc, mnc uint32, lat, lon float64, rssi int32) {
 	point := &cache.CellPoint{
 		Lat:      lat,
 		Lon:      lon,
 		LastSeen: time.Now(),
+		LAC:      lac,
+		MCC:      mcc,
+		MNC:      mnc,
+		EID:      rssi,
 	}
 	s.cache.SetCellPoint(ctx, cellID, lac, point)
-	s.storage.UpdatePointStats(ctx, "cell", fmt.Sprintf("%s:%d", cellID, lac), lat, lon, 0)
+	s.storage.UpdatePointStats(ctx, fmt.Sprintf("cell_%d_%d", mcc, mnc), fmt.Sprintf("%d:%d", cellID, lac), lat, lon, 0)
 }
 
-// Background: save to ClickHouse
+// Save to ClickHouse
 func (s *ValidatorService) saveToHistory(ctx context.Context, req *pb.CoordinateRequest, result pb.ValidationResult, confidence float32) {
 	resultStr := "valid"
 	switch result {
@@ -231,7 +260,7 @@ func (s *ValidatorService) saveToHistory(ctx context.Context, req *pb.Coordinate
 		Timestamp:        time.Unix(req.Timestamp, 0),
 		HasWifi:          len(req.Wifi) > 0,
 		HasBluetooth:     len(req.Bluetooth) > 0,
-		HasCell:          req.CellTower != nil,
+		HasCell:          len(req.CellTowers) > 0,
 		ValidationResult: resultStr,
 		Confidence:       confidence,
 	}
