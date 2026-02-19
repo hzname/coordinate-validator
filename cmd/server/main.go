@@ -18,15 +18,17 @@ func main() {
 	log.Printf("  Max speed: %.1f km/h", cfg.Validation.MaxSpeedKmH)
 	log.Printf("  Max time diff: %v", cfg.Validation.MaxTimeDiff)
 
-	// Create and start handler
+	// Create handler
 	h, err := handler.NewGRPCHandler(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create handler: %v", err)
 	}
 
+	// Start server (blocks until shutdown)
+	// Resources are closed inside Start() after graceful shutdown
 	if err := h.Start(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 
-	h.Stop()
+	log.Println("Server exited cleanly")
 }
