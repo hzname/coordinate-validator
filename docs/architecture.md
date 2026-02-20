@@ -1,5 +1,7 @@
 # Архитектура системы
 
+> **Версия 2.0 — Гибридная микросервисная архитектура**
+
 ## Общая схема
 
 ```mermaid
@@ -10,114 +12,123 @@ flowchart TB
     end
 
     subgraph Gateway
-        LB[Load Balancer]
+        GRPC[gRPC Gateway]
         RateLimit[Rate Limiter]
     end
 
-    subgraph Workers
-        W1[Worker #1]
-        W2[Worker #2]
-        W3[Worker #N]
+    subgraph "Refinement Flow"
+        RefAPI[Refinement API]
+        ValCore[Validation Core]
+    end
+
+    subgraph "Learning Flow"
+        LearnAPI[Learning API]
+        LearnCore[Learning Core]
     end
 
     subgraph Data
         Redis[(Redis Cache)]
-        ClickHouse[(ClickHouse)]
+        Storage[Storage Service]
         Kafka[Kafka Events]
     end
 
-    Device --> LB
-    Service --> LB
-    LB --> RateLimit
-    RateLimit --> W1
-    RateLimit --> W2
-    RateLimit --> W3
-
-    W1 <--> Redis
-    W2 <--> Redis
-    W3 <--> Redis
-
-    W1 --> ClickHouse
-    W2 --> ClickHouse
-    W3 --> ClickHouse
-
-    W1 -.-> Kafka
-    W2 -.-> Kafka
-    W3 -.-> Kafka
+    Device --> GRPC
+    Service --> GRPC
+    GRPC --> RateLimit
+    
+    RateLimit --> RefAPI
+    RateLimit --> LearnAPI
+    
+    RefAPI --> ValCore
+    LearnAPI --> LearnCore
+    
+    ValCore <--> Redis
+    LearnCore <--> Redis
+    
+    ValCore -.-> Storage
+    LearnCore -.-> Storage
+    
+    Storage --> ClickHouse[(ClickHouse)]
+    Storage -.-> Kafka
 ```
 
-## Flow валидации
+## Микросервисы
+
+### 1. API Gateway
+- **Порт:** 50051
+- **Функции:**
+  - gRPC входная точка
+  - Rate limiting
+  - Роутинг: Refinement API vs Learning API
+  - Логирование запросов
+
+### 2. Refinement API
+- **Эндпоинты:** `Validate`, `ValidateBatch`
+- **Особенность:** Только чтение, НЕ участвует в обучении
+- **Результат:** VALID / INVALID / UNCERTAIN + confidence
+
+### 3. Learning API
+- **Эндпоинты:** `LearnFromCoordinates`, `GetCompanionSources`
+- **Особенность:** Запись в кэш, обучение модели
+- **Источники:** Только "companion" устройства
+
+### 4. Validation Core
+- **Логика:**
+  - Time Check: timestamp в пределах 0-12 часов
+  - Speed Check: max 150 км/ч (Haversine distance / time)
+  - Triangulation: WiFi → Cell → Bluetooth
+- **Кэш:** Read-only доступ к Redis
+
+### 5. Learning Core
+- **Логика:**
+  - Companion detection (co-occurrence анализ)
+  - Обновление CALCULATED координат
+  - Агрегация данных для аналитики
+
+### 6. Storage Service
+- **Функции:**
+  - Асинхронная запись в ClickHouse
+  - Producer событий в Kafka
+- **Особенность:** Не блокирует API
+
+## Потоки данных
+
+### Refinement (валидация)
 
 ```mermaid
-flowchart TD
-    Start --> TimeCheck
+sequenceDiagram
+    Client->>Gateway: Validate(coord)
+    Gateway->>Refinement API: forward
+    Refinement API->>Validation Core: validate
+    Validation Core->>Redis: lookup (WiFi/Cell/BT)
+    Redis-->>Validation Core: coordinates
+    Validation Core->>Validation Core: time/speed check
+    Validation Core->>Validation Core: calc confidence
+    Validation Core-->>Refinement API: result
+    Refinement API-->>Gateway: response
+    Gateway-->>Client: VALID/INVALID/UNCERTAIN
     
-    TimeCheck -->|future| TimeInvalid
-    TimeCheck -->|old| TimeOld
-    TimeCheck -->|OK| SpeedCheck
-    
-    SpeedCheck -->|no last| WifiCheck
-    SpeedCheck -->|has last| CalcSpeed
-    
-    CalcSpeed --> SpeedFail
-    SpeedFail -->|yes| SpeedInvalid
-    SpeedFail -->|no| WifiCheck
-    
-    WifiCheck -->|has data| WifiLookup
-    WifiCheck -->|no data| CellCheck
-    
-    WifiLookup -->|found| WifiBoost
-    WifiLookup -->|not found| WifiLearn
-    
-    WifiBoost --> CellCheck
-    WifiLearn --> CellCheck
-    
-    CellCheck -->|has data| CellLookup
-    CellCheck -->|no data| BTCheck
-    
-    CellLookup -->|found| CellBoost
-    CellLookup -->|not found| CellLearn
-    
-    CellBoost --> BTCheck
-    CellLearn --> BTCheck
-    
-    BTCheck -->|has data| BTLookup
-    BTCheck -->|no data| Final
-    
-    BTLookup -->|found| BTBoost
-    BTLookup -->|not found| Final
-    
-    BTBoost --> Final
-    
-    Final --> Result
-    
-    Result -->|INVALID| OutInvalid
-    Result -->|high conf| OutValid
-    Result -->|low conf| OutUncertain
-    
-    TimeInvalid --> Save
-    TimeOld --> Save
-    SpeedInvalid --> Save
-    OutInvalid --> Save
-    OutValid --> Save
-    OutUncertain --> Save
-    
-    Save --> UpdateCache
-    UpdateCache --> End
+    Validation Core->>Storage: async write
+    Storage->>ClickHouse: INSERT
+    Storage->>Kafka: EVENT
 ```
 
-## Flow самообучения
+### Learning (обучение)
 
 ```mermaid
-flowchart LR
-    NewWifi[New WiFi] --> RedisWifi[Redis]
-    NewWifi --> CHWifi[ClickHouse]
+sequenceDiagram
+    Client->>Gateway: LearnFromCoordinates
+    Gateway->>Learning API: forward
+    Learning API->>Learning Core: process
+    Learning Core->>Redis: read existing
+    Learning Core->>Learning Core: companion detection
+    Learning Core->>Redis: UPDATE coordinates
+    Learning Core-->>Learning API: success
+    Learning API-->>Gateway: response
+    Gateway-->>Client: OK
     
-    NewCell[New Cell] --> RedisCell[Redis]
-    NewCell --> CHCell[ClickHouse]
-    
-    NewBT[New BLE] --> RedisBT[Redis]
-    NewBT --> CHBT[ClickHouse]
+    Learning Core->>Storage: async write
+    Storage->>ClickHouse: INSERT
 ```
 
 ## Структура Redis
@@ -150,10 +161,20 @@ erDiagram
     
     DEVICE {
         string device_id PK
-        float lat
-        float lon
+        float last_lat
+        float last_lon
+        int64 last_time
     }
 ```
+
+### Key Schema
+
+| Key Pattern | Type | Description |
+|-------------|------|-------------|
+| `wifi:{bssid}` | Hash | lat, lon, last_seen |
+| `cell:{cell_id}:{lac}` | Hash | lat, lon |
+| `bt:{mac}` | Hash | lat, lon |
+| `device:{device_id}` | Hash | last_lat, last_lon, last_time |
 
 ## Структура ClickHouse
 
@@ -172,14 +193,16 @@ erDiagram
         bool has_cell
         string result
         float confidence
+        string flow_type  # "refinement" or "learning"
     }
     
     STATS {
-        string type PK
-        string point_id PK
+        string type PK        # "wifi", "cell", "bt"
+        string point_id PK    # bssid / cell_id / mac
         float lat
         float lon
         int obs
+        datetime last_updated
     }
 ```
 
@@ -188,65 +211,85 @@ erDiagram
 ```mermaid
 flowchart TB
     subgraph K8s
-        subgraph Svc
-            Ingress[gRPC Ingress]
-            SVC[Service LB]
+        subgraph Ingress
+            Ig[gRPC Ingress]
         end
         
-        subgraph Pods
-            Pod1[validator-1]
-            Pod2[validator-2]
-            Pod3[validator-N]
+        subgraph "API Layer"
+            Gateway[Gateway]
+        end
+        
+        subgraph "API Services"
+            RefAPI[Refinement API]
+            LearnAPI[Learning API]
+        end
+        
+        subgraph "Core Services"
+            ValCore[Validation Core]
+            LearnCore[Learning Core]
         end
         
         subgraph Data
             RedisCl[Redis Cluster]
+            Storage[Storage Service]
             CH[ClickHouse]
             KafkaCl[Kafka Cluster]
         end
     end
     
-    Clients --> Ingress
-    Ingress --> SVC
-    SVC --> Pod1
-    SVC --> Pod2
-    SVC --> Pod3
+    Clients --> Ig
+    Ig --> Gateway
+    Gateway --> RefAPI
+    Gateway --> LearnAPI
     
-    Pod1 --> RedisCl
-    Pod2 --> RedisCl
-    Pod3 --> RedisCl
+    RefAPI --> ValCore
+    LearnAPI --> LearnCore
     
-    Pod1 --> CH
-    Pod2 --> CH
-    Pod3 --> CH
+    ValCore --> RedisCl
+    LearnCore --> RedisCl
     
-    Pod1 --> KafkaCl
-    Pod2 --> KafkaCl
-    Pod3 --> KafkaCl
+    ValCore --> Storage
+    LearnCore --> Storage
+    
+    Storage --> CH
+    Storage --> KafkaCl
 ```
 
 ## Алгоритм работы
 
-### Flow валидации
+### Flow валидации (Refinement)
 
 ```
-Input -> Time Check -> Speed Check -> Source Check -> Result
+Input → Time Check → Speed Check → Source Lookup → Confidence → Result
 ```
 
-### Flow самообучения
+1. **Time Check:** `0 < (Now - timestamp) < 12h`
+2. **Speed Check:** `HaversineDistance(lat1,lon1, lat2,lon2) / TimeDelta < 150 km/h`
+3. **Source Lookup:** WiFi → Cell → BT (boost confidence если найдено)
+4. **Result:** VALID / INVALID / UNCERTAIN
+
+### Flow самообучения (Learning)
 
 ```
-New Data -> Redis Cache -> ClickHouse Analytics
+New Data → Companion Filter → Cache Update → Analytics
 ```
 
-### Проверка скорости
+1. **Companion Filter:** Только co-occurrence источники
+2. **Cache Update:** Запись в Redis
+3. **Analytics:** ClickHouse для долгосрочного анализа
 
-```
-Calculate Haversine -> Distance / Time -> Compare to 150 km/h
-```
+## Разделение потоков
 
-### Проверка времени
+| Поток | API | Операции с кэшем | Обучение |
+|-------|-----|------------------|----------|
+| Refinement | Validate, ValidateBatch | Read only | Нет |
+| Learning | LearnFromCoordinates | Read + Write | Да |
 
-```
-Timestamp - Now -> Check bounds (0 to 12 hours)
-```
+## Преимущества архитектуры
+
+1. **Изоляция потоков** — Refinement и Learning не влияют друг на друга
+2. **Общий кэш** — быстрый доступ к координатам без синхронизации
+3. **Асинхронный storage** — API не блокируется на записи
+4. **Масштабируемость** — можно реплицировать только горячий путь (валидация)
+5. **Гибкость** — каждый сервис развивается отдельно
+6. **Отказоустойчивость** — падение Learning не влияет на Refinement
