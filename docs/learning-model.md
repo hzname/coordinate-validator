@@ -1,272 +1,228 @@
-# Coordinate Validator - Learning Model
+# Learning Model
 
 ## Two Data Streams
 
 ### 1. Refinement (Validation)
-- Incoming data for **validation**
-- Used ONLY for checking coordinates
-- Does NOT participate in learning
+- **Поток:** Входящие данные для валидации
+- **Операции:** Только чтение из кэша
+- **Обучение:** НЕ участвует
+- **API:** `Validate`, `ValidateBatch` → Refinement API (порт 50051)
 
 ### 2. Learning
-- Separate data stream
-- Only "stationary" sources
-- Updates CALCULATED coordinates
+- **Поток:** Данные для обучения
+- **Операции:** Чтение + запись в кэш
+- **Обучение:** Companion detection, обновление координат
+- **API:** `LearnFromCoordinates` → Learning API (порт 50052)
+
+---
+
+## Algorithm: Companion Detection
+
+```mermaid
+flowchart TD
+    Input[Learn Request] --> GetHistory[Get existing companions]
+    
+    GetHistory --> Detect[Detect companions from WiFi/Cell/BT]
+    
+    Detect --> AddNew[Add new to cache]
+    
+    AddNew --> ProcessWiFi[Process WiFi]
+    ProcessWiFi --> ProcessCell[Process Cell towers]
+    ProcessCell --> ProcessBT[Process Bluetooth]
+    
+    ProcessWiFi --> IsCompanion{Is Companion?}
+    ProcessCell --> IsCompanion
+    ProcessBT --> IsCompanion
+    
+    IsCompanion -->|Yes| UpdateFast[Update: weight=0.2]
+    IsCompanion -->|No| UpdateSlow[Update: weight=0.1]
+    
+    UpdateFast --> CalcConf[Calculate confidence]
+    UpdateSlow --> CalcConf
+    
+    CalcConf --> Determine{Determine result}
+    
+    Determine -->|stationary > 0| STATIONARY[STATIONARY_DETECTED]
+    Determine -->|random > 2*stationary| RANDOM[RANDOM_EXCLUDED]
+    Determine -->|default| LEARNED[LEARNED]
+    Determine -->|no data| NEED_MORE[NEED_MORE_DATA]
+```
+
+---
+
+## Confidence Calculation
+
+```go
+func calculateConfidence(obsCount int64) float64 {
+    // Confidence grows logarithmically with observations
+    // Max ~0.95 at 1000 observations
+    const maxObs = 1000.0
+    const maxConf = 0.95
+    
+    if obsCount <= 1 {
+        return 0.3
+    }
+    
+    return maxConf * (1 - math.Exp(-float64(obsCount)/maxObs*5))
+}
+```
+
+### Confidence Thresholds
+
+| Level | Threshold | Result |
+|-------|-----------|--------|
+| High | ≥ 0.8 | VALID |
+| Medium | 0.3 - 0.79 | UNCERTAIN |
+| Low | < 0.3 | INVALID |
 
 ---
 
 ## Configuration Parameters
 
-All thresholds are configurable via Admin API or configuration file.
-
 ### Validation Parameters
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `validation.max_speed_kmh` | 150 | 50-500 | Max allowed speed (km/h) |
-| `validation.max_time_diff_hours` | 12 | 1-72 | Max timestamp deviation (hours) |
-| `validation.min_accuracy_meters` | 100 | 10-500 | Min GPS accuracy to accept |
+| `validation.max_speed_kmh` | 150 | 50-500 | Max speed (km/h) |
+| `validation.max_time_diff_hours` | 12 | 1-72 | Max timestamp deviation |
+| `validation.confidence.high` | 0.8 | 0.5-1.0 | High confidence threshold |
+| `validation.confidence.medium` | 0.5 | 0.3-0.8 | Medium confidence threshold |
+| `validation.confidence.low` | 0.3 | 0.1-0.5 | Low confidence threshold |
 
-### Stationary Detection Parameters
+### Learning Parameters
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `learning.min_observations` | 3 | 1-10 | Min appearances for stationary |
-| `learning.variance_threshold` | 0.0001 | 0.00001-0.001 | Max lat/lon variance (degrees² ≈ meters) |
-| `learning.time_window_hours` | 24 | 1-168 | Analysis time window |
+| `learning.min_observations` | 3 | 1-10 | Min observations for stationary |
+| `learning.variance_threshold` | 0.0001 | 0.00001-0.001 | Max lat/lon variance |
+| `learning.weight.companion` | 0.2 | 0.1-0.5 | Weight for companion updates |
+| `learning.weight.random` | 0.1 | 0.05-0.3 | Weight for random updates |
 
 ### Positioning Parameters
 
-| Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
-| `positioning.radius_wifi_meters` | 50 | 10-100 | WiFi uncertainty radius |
-| `positioning.radius_ble_meters` | 5 | 1-30 | BLE uncertainty radius |
-| `positioning.radius_cell_lac_meters` | 3000 | 500-10000 | Cell LAC uncertainty radius |
-| `positioning.radius_cell_atc_meters` | 300 | 50-1000 | Cell ATC uncertainty radius |
-| `positioning.min_sources` | 2 | 1-5 | Min sources for triangulation |
-| `positioning.deviation_threshold_meters` | 50 | 10-200 | Max deviation for validation |
-
-### Adaptive Thresholds
-
-Thresholds scale based on number of sources:
-
-```yaml
-# Formula: BASE + (sources - 1) * STEP
-adaptive:
-  absolute_threshold_base: 50      # meters
-  absolute_threshold_step: 10      # per source
-  deviation_threshold_base: 100    # meters
-  deviation_threshold_step: 20     # per source
-```
-
-### Mobile Filter Parameters
-
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `filter.rssi_change_threshold` | 10 | Max RSSI change (dBm) per window |
-| `filter.rssi_change_window_seconds` | 60 | RSSI analysis window |
-
----
-
-## Admin API
-
-All parameters can be managed via Admin API:
-
-```protobuf
-service AdminService {
-    // Get all parameters
-    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
-    
-    // Update parameter
-    rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
-    
-    // Reset to defaults
-    rpc ResetConfig(ResetConfigRequest) returns (ResetConfigResponse);
-    
-    // Get config history
-    rpc GetConfigHistory(HistoryRequest) returns (HistoryResponse);
-}
-
-message GetConfigRequest {
-    string category = 1;  // "validation", "learning", "positioning", "filter"
-}
-
-message UpdateConfigRequest {
-    string key = 1;
-    string value = 2;
-    string reason = 3;  // Reason for change
-}
-
-message UpdateConfigResponse {
-    bool success = 1;
-    string old_value = 2;
-    string new_value = 3;
-    int64 changed_at = 4;
-}
-```
-
-### Example: Update threshold
-
-```bash
-# Update max speed
-grpcurl -plaintext -d '{
-  "key": "validation.max_speed_kmh",
-  "value": "200",
-  "reason": "High-speed vehicle tracking"
-}' localhost:50051 coordinate.Admin/UpdateConfig
-
-# Get all learning params
-grpcurl -plaintext -d '{
-  "category": "learning"
-}' localhost:50051 coordinate.Admin/GetConfig
-```
-
----
-
-## Configuration File
-
-```yaml
-validation:
-  max_speed_kmh: 150
-  max_time_diff_hours: 12
-  min_accuracy_meters: 100
-
-learning:
-  min_observations: 3
-  variance_threshold: 0.0001
-  time_window_hours: 24
-
-positioning:
-  radius_wifi_meters: 50
-  radius_ble_meters: 15
-  radius_cell_lac_meters: 3000
-  radius_cell_atc_meters: 300
-  min_sources: 2
-  deviation_threshold_meters: 50
-
-adaptive:
-  absolute_threshold_base: 50
-  absolute_threshold_step: 10
-  deviation_threshold_base: 100
-  deviation_threshold_step: 20
-
-filter:
-  rssi_change_threshold: 10
-  rssi_change_window_seconds: 60
-```
-
----
-
-## Configuration Flow
-
-```mermaid
-flowchart LR
-    subgraph Sources
-        AdminUI[Admin UI]
-        ConfigFile[config.yaml]
-        EnvVars[Environment Variables]
-    end
-    
-    subgraph Validation
-        Check{Validate<br/>parameter}
-    end
-    
-    AdminUI --> Check
-    ConfigFile --> Check
-    EnvVars --> Check
-    
-    Check --> Apply[Apply to<br/>system]
-    Apply --> Log[Log change<br/>history]
-```
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph Input
-        Refine[Refinement<br/>Validate API]
-        Learn[Learning<br/>Learn API]
-    end
-    
-    subgraph Process
-        Refine --> Validate
-        Learn --> StationaryCheck
-        StationaryCheck --> Update
-    end
-    
-    subgraph Output
-        Validate --> Result[VALID/INVALID/UNCERTAIN]
-        Update --> DB[CALCULATED coordinates]
-    end
-    
-    Refine -.-> NotLearn
-```
-
----
-
-## Algorithm: Stationary Detection
-
-```mermaid
-flowchart TD
-    Input --> GetHistory
-    
-    GetHistory --> Count
-    
-    Count -->|No| Random
-    Random --> Exclude
-    
-    Count -->|Yes| CalcVariance
-    
-    CalcVariance --> VarianceOK
-    
-    VarianceOK -->|Yes| Stationary
-    VarianceOK -->|No| Unstable
-    
-    Stationary --> Include
-    Unstable --> Exclude2
-```
+| `positioning.radius_wifi_meters` | 50 | WiFi uncertainty radius |
+| `positioning.radius_ble_meters` | 5 | BLE uncertainty radius |
+| `positioning.radius_cell_meters` | 3000 | Cell tower uncertainty |
+| `positioning.min_sources` | 2 | Min sources for triangulation |
 
 ---
 
 ## Redis Structure
 
-```
-# Configuration (cached)
-config:{category}:{key} → value
-
-# Configuration history
-config_history:{key} → [
-    {value, changed_at, changed_by, reason},
-    ...
-]
-
-# Source observations
-observation:{object_id}:{source_type}:{source_id} → {
-    observations: [{lat, lon, timestamp}],
-    observations_count,
-    variance_lat, variance_lon,
-    status: NEW | STATIONARY | RANDOM,
-    first_seen, last_seen
+### WiFi Cache
+```json
+{
+  "wifi:AA:BB:CC:DD:EE:FF": {
+    "bssid": "AA:BB:CC:DD:EE:FF",
+    "lat": 55.7558,
+    "lon": 37.6173,
+    "last_seen": "2026-02-20T12:00:00Z",
+    "version": 42,
+    "obs_count": 150,
+    "confidence": 0.87
+  }
 }
+```
 
-# CALCULATED coordinates
-calculated:{type}:{id} → {lat, lon, confidence, observations}
+### Cell Cache
+```json
+{
+  "cell:12345:678": {
+    "cell_id": 12345,
+    "lac": 678,
+    "lat": 55.7558,
+    "lon": 37.6173,
+    "version": 10,
+    "obs_count": 50,
+    "confidence": 0.65
+  }
+}
+```
 
-# ABSOLUTE coordinates
-absolute:{type}:{id} → {lat, lon, accuracy, source, expires_at}
+### Device Position
+```json
+{
+  "device:vehicle123": {
+    "device_id": "vehicle123",
+    "lat": 55.7558,
+    "lon": 37.6173,
+    "timestamp": 1700000000,
+    "last_seen": "2026-02-20T12:00:00Z"
+  }
+}
+```
+
+### Companions Set
+```
+companions:device123 → {"wifi:AA:BB:CC:DD:EE:FF", "cell:12345:678"}
+```
+
+---
+
+## Flow: Online vs Offline Learning
+
+### Online Learning (real-time)
+```
+Request → Learning API → Learning Core → Redis write
+                                           ↓
+                                    Storage Service
+                                           ↓
+                               ClickHouse + Kafka events
+```
+- Latency: ~100ms
+- Weight: 0.2 (companion) / 0.1 (random)
+
+### Offline Learning (batch)
+```
+Cron job → Retrain model → Update thresholds → ClickHouse analytics
+```
+- Run: 1x/сутки (ночью)
+- Model: Isolation Forest / LSTM для аномалий
+
+---
+
+## Kafka Events
+
+### Refinement Event
+```json
+{
+  "device_id": "vehicle123",
+  "latitude": 55.7558,
+  "longitude": 37.6173,
+  "timestamp": 1700000000,
+  "result": "VALID",
+  "confidence": 0.92,
+  "has_wifi": true,
+  "has_bt": false,
+  "has_cell": true,
+  "event_time": "2026-02-20T12:00:00Z"
+}
+```
+
+### Learning Event
+```json
+{
+  "object_id": "device123",
+  "latitude": 55.7558,
+  "longitude": 37.6173,
+  "timestamp": 1700000000,
+  "wifi": [...],
+  "cell_towers": [...],
+  "is_companion": true,
+  "event_time": "2026-02-20T12:00:00Z"
+}
 ```
 
 ---
 
 ## Summary
 
-| Category | Parameters | Admin API |
-|----------|------------|-----------|
-| Validation | max_speed, max_time, min_accuracy | ✅ |
-| Learning | min_observations, variance, time_window | ✅ |
-| Positioning | radii, min_sources, deviation | ✅ |
-| Adaptive | threshold_base, threshold_step | ✅ |
-| Filter | rssi_change_threshold | ✅ |
+| Category | API | Parameters |
+|----------|-----|------------|
+| Validation | Refinement API :50051 | max_speed, max_time, thresholds |
+| Learning | Learning API :50052 | min_obs, variance, weights |
+| Storage | Storage Service :50053 | batch_size, flush_interval |
 
-All parameters are runtime-configurable with history tracking.
+All parameters are configurable via environment variables or config file.
