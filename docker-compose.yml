@@ -1,13 +1,80 @@
 version: '3.8'
 
 services:
+  # ============================================
+  # API Gateway
+  # ============================================
+  gateway:
+    build: .
+    ports:
+      - "50050:50050"
+    environment:
+      - SERVER_PORT=50050
+      - REFINEMENT_ADDR=refinement-api:50051
+      - LEARNING_ADDR=learning-api:50052
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - refinement-api
+      - learning-api
+      - redis
+
+  # ============================================
+  # Refinement API (Validation)
+  # ============================================
+  refinement-api:
+    build: .
+    ports:
+      - "50051:50051"
+    environment:
+      - SERVER_PORT=50051
+      - REDIS_ADDR=redis:6379
+      - CLICKHOUSE_ADDR=clickhouse:9000
+      - MAX_SPEED_KMH=150
+      - MAX_TIME_DIFF=12h
+    depends_on:
+      - redis
+      - clickhouse
+      - storage-service
+
+  # ============================================
+  # Learning API
+  # ============================================
+  learning-api:
+    build: .
+    ports:
+      - "50052:50052"
+    environment:
+      - SERVER_PORT=50052
+      - REDIS_ADDR=redis:6379
+      - CLICKHOUSE_ADDR=clickhouse:9000
+    depends_on:
+      - redis
+      - clickhouse
+
+  # ============================================
+  # Storage Service (Async writes)
+  # ============================================
+  storage-service:
+    build: .
+    ports:
+      - "50053:50053"
+    environment:
+      - SERVER_PORT=50053
+      - CLICKHOUSE_ADDR=clickhouse:9000
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - clickhouse
+      - kafka
+
+  # ============================================
+  # Data Stores
+  # ============================================
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+      - redis-data:/data
 
   clickhouse:
     image: clickhouse/clickhouse-server:23.8
@@ -15,33 +82,31 @@ services:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - clickhouse_data:/var/lib/clickhouse
-    environment:
-      CLICKHOUSE_DB: coordinates
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      - ch-data:/var/lib/clickhouse
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
     ports:
-      - "50051:50051"
-    depends_on:
-      - redis
-      - clickhouse
+      - "9092:9092"
     environment:
-      SERVER_PORT: "50051"
-      REDIS_ADDR: "redis:6379"
-      CLICKHOUSE_ADDR: "clickhouse:9000"
-      CLICKHOUSE_DB: "coordinates"
-    volumes:
-      - ./proto:/app/proto
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
 
 volumes:
-  redis_data:
-  clickhouse_data:
+  redis-data:
+  ch-data:
